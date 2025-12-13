@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout repository  # ← 修复：让 gh CLI 在 git 仓库中运行
+        uses: actions/checkout@v4
+        
       - name: Get latest version
         id: version
         run: |
@@ -20,9 +23,10 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          
       - name: Check and update
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh CLI必需
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # ← 必需：gh CLI 认证
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
@@ -34,7 +38,7 @@ jobs:
               echo "Error: File download failed or too small"
               exit 1
             fi
-            gh release delete latest --yes 2>/dev/null || true
+            gh release delete latest --yes 2>/dev/null || true  # 删除旧release（如果存在）
             gh release create latest \
               --title "AdGuardHome v${VERSION}" \
               --notes "AdGuardHome v${VERSION} - Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
