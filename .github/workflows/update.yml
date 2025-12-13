@@ -30,6 +30,12 @@ jobs:
             return 0
           }
           
+          # 清理版本号函数（移除v前缀）
+          clean_version() {
+            local version="$1"
+            [[ -n "$version" ]] && echo "$version" | sed 's/^v//' || echo ""
+          }
+          
           # 指数退避重试函数
           retry_with_backoff() {
             local max_attempts=3
@@ -85,7 +91,10 @@ jobs:
             
             # 确保输出目录存在
             local output_dir=$(dirname "$output")
-            mkdir -p "$output_dir"
+            mkdir -p "$output_dir" 2>/dev/null || {
+              echo "Error: Cannot create output directory"
+              return 1
+            }
             
             # 使用curl下载并获取状态码
             local response_code
@@ -126,7 +135,7 @@ jobs:
                 local lock_age=$(($(date +%s) - $(stat -c%Y "$lock_file" 2>/dev/null || echo "0")))
                 if [[ $lock_age -gt 1800 ]]; then
                   echo "Lock file is stale, removing..."
-                  rm -f "$lock_file"
+                  rm -f "$lock_file" 2>/dev/null || true
                   break
                 fi
               fi
@@ -183,8 +192,17 @@ jobs:
             exit 1
           fi
           
-          # 解析版本号
-          VERSION=$(jq -r '.tag_name' "/tmp/latest_release.json" 2>/dev/null || echo "")
+          # 解析版本号（原始格式，保留v前缀用于输出）
+          RAW_VERSION=$(jq -r '.tag_name' "/tmp/latest_release.json" 2>/dev/null || echo "")
+          
+          # 检查是否获取到版本号
+          if [[ -z "$RAW_VERSION" ]] || [[ "$RAW_VERSION" == "null" ]]; then
+            log_update_event "ERROR" "Cannot extract version from API response"
+            exit 1
+          fi
+          
+          # 清理版本号用于验证
+          VERSION=$(clean_version "$RAW_VERSION")
           
           # 验证版本格式
           if ! validate_version "$VERSION"; then
@@ -198,7 +216,10 @@ jobs:
           fi
           
           log_update_event "SUCCESS" "Latest version: $VERSION"
+          # 输出清理后的版本号（无v前缀）
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # 同时输出原始版本号（带v前缀）用于显示
+          echo "raw_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
           
           # 保存版本信息供后续步骤使用
           cp "/tmp/latest_release.json" "/tmp/latest_release_final.json" 2>/dev/null || true
@@ -218,6 +239,12 @@ jobs:
               return 1
             fi
             return 0
+          }
+          
+          # 清理版本号函数（移除v前缀）
+          clean_version() {
+            local version="$1"
+            [[ -n "$version" ]] && echo "$version" | sed 's/^v//' || echo ""
           }
           
           # 指数退避重试函数
@@ -306,7 +333,10 @@ jobs:
             
             # 确保输出目录存在
             local output_dir=$(dirname "$output")
-            mkdir -p "$output_dir"
+            mkdir -p "$output_dir" 2>/dev/null || {
+              echo "Error: Cannot create output directory"
+              return 1
+            }
             
             local response_code
             response_code=$(curl -s -L -w "%{http_code}" \
@@ -341,7 +371,10 @@ jobs:
           # 确保在失败时释放锁
           trap 'release_lock' EXIT
           
+          # 获取版本号（清理后的，无v前缀）
           VERSION="${{ steps.version.outputs.version }}"
+          RAW_VERSION="${{ steps.version.outputs.raw_version }}"
+          
           log_update_event "INFO" "Checking for updates, target version: $VERSION"
           
           # 验证版本变量
@@ -360,11 +393,19 @@ jobs:
             if [[ -f "/tmp/current_release.json" ]] && [[ -s "/tmp/current_release.json" ]]; then
               # 验证JSON格式
               if jq empty "/tmp/current_release.json" 2>/dev/null; then
-                CURRENT=$(jq -r '.tag_name' "/tmp/current_release.json" 2>/dev/null || echo "")
+                CURRENT_RAW=$(jq -r '.tag_name' "/tmp/current_release.json" 2>/dev/null || echo "")
                 
-                # 如果当前版本为空或无效，设置为默认值
-                if ! validate_version "$CURRENT" 2>/dev/null; then
-                  log_update_event "WARNING" "Current version invalid or not found: $CURRENT"
+                # 检查是否获取到有效的当前版本
+                if [[ -n "$CURRENT_RAW" ]] && [[ "$CURRENT_RAW" != "null" ]]; then
+                  CURRENT=$(clean_version "$CURRENT_RAW")
+                  
+                  # 如果当前版本为空或无效，设置为默认值
+                  if ! validate_version "$CURRENT" 2>/dev/null; then
+                    log_update_event "WARNING" "Current version invalid or not found: $CURRENT_RAW"
+                    CURRENT="0.0.0"
+                  fi
+                else
+                  log_update_event "WARNING" "Current version tag is null or empty"
                   CURRENT="0.0.0"
                 fi
               else
@@ -383,8 +424,10 @@ jobs:
           if [[ "$CURRENT" != "$VERSION" ]]; then
             log_update_event "INFO" "Update needed: $CURRENT -> $VERSION"
             
-            # 下载新版本
+            # 下载新版本（使用清理后的版本号，避免重复v）
             DOWNLOAD_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v${VERSION}/AdGuardHome_linux_amd64.tar.gz"
+            log_update_event "INFO" "Downloading from: $DOWNLOAD_URL"
+            
             if ! retry_with_backoff curl_with_retry "$DOWNLOAD_URL" "AdGuardHome_linux_amd64.tar.gz" 300; then
               log_update_event "ERROR" "Failed to download AdGuardHome v${VERSION}"
               exit 1
@@ -401,6 +444,12 @@ jobs:
             # 检查gh命令是否可用
             if ! command -v gh >/dev/null 2>&1; then
               log_update_event "ERROR" "gh command not found"
+              exit 1
+            fi
+            
+            # 检查GITHUB_TOKEN是否设置
+            if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+              log_update_event "ERROR" "GITHUB_TOKEN is not set"
               exit 1
             fi
             
