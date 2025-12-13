@@ -45,9 +45,7 @@ jobs:
             # 创建新的latest release（强制使用latest标签）
             gh release create latest \
               --title "AdGuardHome v$VERSION" \
-              --notes "AdGuardHome v$VERSION Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-固定下载地址: https://github.com/${{ github.repository }}/releases/download/latest/AdGuardHome_linux_amd64.tar.gz" \
+              --notes "AdGuardHome v$VERSION Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC') - Fixed download URL: https://github.com/${{ github.repository }}/releases/download/latest/AdGuardHome_linux_amd64.tar.gz" \
               AdGuardHome_linux_amd64.tar.gz
           else
             echo "Already latest version: v$VERSION"
