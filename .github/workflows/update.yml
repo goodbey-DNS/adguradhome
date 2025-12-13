@@ -13,11 +13,206 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         
-      - name: Setup common functions
+      - name: Get latest version
+        id: version
         run: |
+          set -euo pipefail
+          
           # 版本验证函数
           validate_version() {
             local version="$1"
+            # 移除可能的v前缀
+            version=$(echo "$version" | sed 's/^v//')
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Error: Invalid version format: $version"
+              return 1
+            fi
+            return 0
+          }
+          
+          # 指数退避重试函数
+          retry_with_backoff() {
+            local max_attempts=3
+            local base_delay=5
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+              if "$@"; then
+                return 0
+              fi
+              
+              if [ $attempt -lt $max_attempts ]; then
+                local delay=$((base_delay * (2**(attempt-1))))
+                echo "Attempt $attempt failed, retrying in ${delay}s..."
+                sleep $delay
+              fi
+              
+              ((attempt++))
+            done
+            
+            return 1
+          }
+          
+          # API错误处理函数
+          handle_api_error() {
+            local response_code="$1"
+            
+            case "$response_code" in
+              403|429)
+                echo "Rate limit exceeded. Waiting before retry..."
+                return 2
+                ;;
+              404)
+                echo "Resource not found"
+                return 1
+                ;;
+              5*)
+                echo "Server error, will retry"
+                return 2
+                ;;
+              *)
+                echo "Unexpected error: $response_code"
+                return 1
+                ;;
+            esac
+          }
+          
+          # 增强的curl函数，包含重试和错误处理
+          curl_with_retry() {
+            local url="$1"
+            local output="$2"
+            local max_time="${3:-10}"
+            
+            # 确保输出目录存在
+            local output_dir=$(dirname "$output")
+            mkdir -p "$output_dir"
+            
+            # 使用curl下载并获取状态码
+            local response_code
+            response_code=$(curl -s -L -w "%{http_code}" \
+              --max-time "$max_time" \
+              --retry 2 \
+              --retry-delay 3 \
+              -o "$output" \
+              "$url" 2>/dev/null || echo "000")
+            
+            if [[ $response_code -ge 400 ]] || [[ $response_code == "000" ]]; then
+              handle_api_error "$response_code"
+              return $?
+            fi
+            
+            return 0
+          }
+          
+          # 日志记录函数
+          log_update_event() {
+            local event="$1"
+            local details="$2"
+            local timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "TIMESTAMP_ERROR")
+            
+            echo "[$timestamp] $event: $details"
+          }
+          
+          # 并发控制锁机制
+          acquire_lock() {
+            local lock_file="/tmp/adguard_update.lock"
+            local max_wait=300
+            local wait_interval=5
+            local waited=0
+            
+            while [[ -f "$lock_file" ]]; do
+              # 检查锁文件是否过期（超过30分钟）
+              if [[ -f "$lock_file" ]]; then
+                local lock_age=$(($(date +%s) - $(stat -c%Y "$lock_file" 2>/dev/null || echo "0")))
+                if [[ $lock_age -gt 1800 ]]; then
+                  echo "Lock file is stale, removing..."
+                  rm -f "$lock_file"
+                  break
+                fi
+              fi
+              
+              if [[ $waited -ge $max_wait ]]; then
+                echo "Error: Another update process is running"
+                return 1
+              fi
+              
+              echo "Waiting for lock... ($waited/$max_wait)"
+              sleep $wait_interval
+              ((waited+=wait_interval))
+            done
+            
+            echo $$ > "$lock_file" 2>/dev/null || {
+              echo "Error: Cannot create lock file"
+              return 1
+            }
+            return 0
+          }
+          
+          release_lock() {
+            rm -f "/tmp/adguard_update.lock" 2>/dev/null || true
+          }
+          
+          log_update_event "INFO" "Starting version check"
+          
+          # 获取锁
+          if ! acquire_lock; then
+            echo "Failed to acquire lock, exiting"
+            exit 1
+          fi
+          
+          # 确保在退出时释放锁
+          trap 'release_lock' EXIT
+          
+          # 使用重试机制获取版本信息
+          if ! retry_with_backoff curl_with_retry \
+            "https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest" \
+            "/tmp/latest_release.json" 10; then
+            log_update_event "ERROR" "Failed to fetch latest version after retries"
+            exit 1
+          fi
+          
+          # 检查文件是否有效
+          if [[ ! -f "/tmp/latest_release.json" ]] || [[ ! -s "/tmp/latest_release.json" ]]; then
+            log_update_event "ERROR" "Invalid response file"
+            exit 1
+          fi
+          
+          # 验证JSON格式
+          if ! jq empty "/tmp/latest_release.json" 2>/dev/null; then
+            log_update_event "ERROR" "Invalid JSON response"
+            exit 1
+          fi
+          
+          # 解析版本号
+          VERSION=$(jq -r '.tag_name' "/tmp/latest_release.json" 2>/dev/null || echo "")
+          
+          # 验证版本格式
+          if ! validate_version "$VERSION"; then
+            log_update_event "ERROR" "Invalid version format: $VERSION"
+            exit 1
+          fi
+          
+          if [[ -z "$VERSION" ]]; then
+            log_update_event "ERROR" "Cannot get version info"
+            exit 1
+          fi
+          
+          log_update_event "SUCCESS" "Latest version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          
+          # 保存版本信息供后续步骤使用
+          cp "/tmp/latest_release.json" "/tmp/latest_release_final.json" 2>/dev/null || true
+          
+      - name: Check and update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          
+          # 版本验证函数
+          validate_version() {
+            local version="$1"
+            version=$(echo "$version" | sed 's/^v//')
             if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "Error: Invalid version format: $version"
               return 1
@@ -60,15 +255,21 @@ jobs:
             fi
             
             # 检查文件大小
-            local actual_size=$(stat -c%s "$file")
+            local actual_size
+            actual_size=$(stat -c%s "$file" 2>/dev/null || echo "0")
             if [[ $actual_size -lt $expected_size ]]; then
               echo "Error: File too small: $actual_size bytes (expected at least $expected_size)"
               return 1
             fi
             
             # 计算并验证SHA-256
-            local sha256_hash=$(sha256sum "$file" | cut -d' ' -f1)
-            echo "File SHA-256: $sha256_hash"
+            if command -v sha256sum >/dev/null 2>&1; then
+              local sha256_hash
+              sha256_hash=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || echo "")
+              if [[ -n "$sha256_hash" ]]; then
+                echo "File SHA-256: $sha256_hash"
+              fi
+            fi
             
             return 0
           }
@@ -76,12 +277,11 @@ jobs:
           # API错误处理函数
           handle_api_error() {
             local response_code="$1"
-            local response_body="$2"
             
             case "$response_code" in
               403|429)
                 echo "Rate limit exceeded. Waiting before retry..."
-                return 2  # 表示可重试错误
+                return 2
                 ;;
               404)
                 echo "Resource not found"
@@ -89,7 +289,7 @@ jobs:
                 ;;
               5*)
                 echo "Server error, will retry"
-                return 2  # 表示可重试错误
+                return 2
                 ;;
               *)
                 echo "Unexpected error: $response_code"
@@ -98,54 +298,29 @@ jobs:
             esac
           }
           
-          # 并发控制锁机制
-          acquire_lock() {
-            local lock_file="/tmp/adguard_update.lock"
-            local max_wait=300  # 5分钟
-            local wait_interval=5
-            local waited=0
-            
-            while [[ -f "$lock_file" ]]; do
-              if [[ $waited -ge $max_wait ]]; then
-                echo "Error: Another update process is running"
-                return 1
-              fi
-              
-              echo "Waiting for lock... ($waited/$max_wait)"
-              sleep $wait_interval
-              ((waited+=wait_interval))
-            done
-            
-            echo $$ > "$lock_file"
-            return 0
-          }
-          
-          release_lock() {
-            rm -f "/tmp/adguard_update.lock"
-          }
-          
           # 增强的curl函数，包含重试和错误处理
           curl_with_retry() {
             local url="$1"
             local output="$2"
             local max_time="${3:-10}"
             
-            local response_file=$(mktemp)
+            # 确保输出目录存在
+            local output_dir=$(dirname "$output")
+            mkdir -p "$output_dir"
+            
             local response_code
-            
-            response_code=$(curl -s -w "%{http_code}" \
+            response_code=$(curl -s -L -w "%{http_code}" \
               --max-time "$max_time" \
+              --retry 2 \
+              --retry-delay 3 \
               -o "$output" \
-              "$url" 2>"$response_file")
+              "$url" 2>/dev/null || echo "000")
             
-            if [[ $response_code -ge 400 ]]; then
-              handle_api_error "$response_code" "$(cat "$response_file")"
-              local result=$?
-              rm -f "$response_file"
-              return $result
+            if [[ $response_code -ge 400 ]] || [[ $response_code == "000" ]]; then
+              handle_api_error "$response_code"
+              return $?
             fi
             
-            rm -f "$response_file"
             return 0
           }
           
@@ -153,72 +328,15 @@ jobs:
           log_update_event() {
             local event="$1"
             local details="$2"
-            local timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+            local timestamp
+            timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "TIMESTAMP_ERROR")
             
             echo "[$timestamp] $event: $details"
           }
           
-          # 导出函数供后续步骤使用
-          export -f validate_version
-          export -f retry_with_backoff
-          export -f verify_file_integrity
-          export -f handle_api_error
-          export -f acquire_lock
-          export -f release_lock
-          export -f curl_with_retry
-          export -f log_update_event
-        
-      - name: Get latest version
-        id: version
-        run: |
-          set -euo pipefail
-          
-          log_update_event "INFO" "Starting version check"
-          
-          # 获取锁
-          if ! acquire_lock; then
-            echo "Failed to acquire lock, exiting"
-            exit 1
-          fi
-          
-          # 使用重试机制获取版本信息
-          VERSION=$(retry_with_backoff curl_with_retry \
-            "https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest" \
-            "/tmp/latest_release.json" 10)
-          
-          if [[ $? -ne 0 ]]; then
-            log_update_event "ERROR" "Failed to fetch latest version after retries"
-            release_lock
-            exit 1
-          fi
-          
-          # 解析版本号
-          VERSION=$(jq -r '.tag_name' "/tmp/latest_release.json" | sed 's/v//')
-          
-          # 验证版本格式
-          if ! validate_version "$VERSION"; then
-            log_update_event "ERROR" "Invalid version format: $VERSION"
-            release_lock
-            exit 1
-          fi
-          
-          if [[ -z "$VERSION" ]]; then
-            log_update_event "ERROR" "Cannot get version info"
-            release_lock
-            exit 1
-          fi
-          
-          log_update_event "SUCCESS" "Latest version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          
-          # 保存版本信息供后续步骤使用
-          cp "/tmp/latest_release.json" "/tmp/latest_release_final.json"
-          
-      - name: Check and update
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+          release_lock() {
+            rm -f "/tmp/adguard_update.lock" 2>/dev/null || true
+          }
           
           # 确保在失败时释放锁
           trap 'release_lock' EXIT
@@ -226,21 +344,39 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           log_update_event "INFO" "Checking for updates, target version: $VERSION"
           
-          # 获取当前版本
-          CURRENT=$(retry_with_backoff curl_with_retry \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            "/tmp/current_release.json" 10)
-          
-          if [[ $? -ne 0 ]]; then
-            log_update_event "ERROR" "Failed to fetch current version after retries"
+          # 验证版本变量
+          if [[ -z "$VERSION" ]]; then
+            log_update_event "ERROR" "Version variable is empty"
             exit 1
           fi
           
-          CURRENT=$(jq -r '.tag_name' "/tmp/current_release.json" | sed 's/v//')
-          
-          # 如果当前版本为空或无效，设置为默认值
-          if ! validate_version "$CURRENT" 2>/dev/null; then
-            log_update_event "WARNING" "Current version invalid or not found: $CURRENT"
+          # 获取当前版本
+          CURRENT="0.0.0"
+          if retry_with_backoff curl_with_retry \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            "/tmp/current_release.json" 10; then
+            
+            # 检查文件是否有效
+            if [[ -f "/tmp/current_release.json" ]] && [[ -s "/tmp/current_release.json" ]]; then
+              # 验证JSON格式
+              if jq empty "/tmp/current_release.json" 2>/dev/null; then
+                CURRENT=$(jq -r '.tag_name' "/tmp/current_release.json" 2>/dev/null || echo "")
+                
+                # 如果当前版本为空或无效，设置为默认值
+                if ! validate_version "$CURRENT" 2>/dev/null; then
+                  log_update_event "WARNING" "Current version invalid or not found: $CURRENT"
+                  CURRENT="0.0.0"
+                fi
+              else
+                log_update_event "WARNING" "Invalid JSON response for current version"
+                CURRENT="0.0.0"
+              fi
+            else
+              log_update_event "WARNING" "Current release info not available, assuming first release"
+              CURRENT="0.0.0"
+            fi
+          else
+            log_update_event "WARNING" "Failed to fetch current version, assuming first release"
             CURRENT="0.0.0"
           fi
           
@@ -262,12 +398,18 @@ jobs:
             
             log_update_event "INFO" "File downloaded and verified successfully"
             
+            # 检查gh命令是否可用
+            if ! command -v gh >/dev/null 2>&1; then
+              log_update_event "ERROR" "gh command not found"
+              exit 1
+            fi
+            
             # 删除旧release并创建新release
             gh release delete latest --yes 2>/dev/null || true
             
             if gh release create latest \
               --title "AdGuardHome v${VERSION}" \
-              --notes "AdGuardHome v${VERSION} - Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              --notes "AdGuardHome v${VERSION} - Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo 'TIME_ERROR')" \
               AdGuardHome_linux_amd64.tar.gz; then
               log_update_event "SUCCESS" "Successfully released v${VERSION}"
             else
@@ -279,4 +421,4 @@ jobs:
           fi
           
           # 清理临时文件
-          rm -f /tmp/*.json /tmp/*.tar.gz
+          rm -f /tmp/*.json /tmp/*.tar.gz 2>/dev/null || true
