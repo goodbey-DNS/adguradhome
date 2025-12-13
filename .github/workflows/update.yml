@@ -13,28 +13,33 @@ jobs:
       - name: Get latest version
         id: version
         run: |
+          set -euo pipefail
           VERSION=$(curl -s --max-time 10 https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | jq -r '.tag_name' | sed 's/v//')
           if [[ -z "$VERSION" ]]; then
             echo "Error: Cannot get version info"
             exit 1
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Check and update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # gh CLI必需
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
-          CURRENT=$(curl -s --max-time 10 https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          CURRENT=$(curl -s --max-time 10 "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name' | sed 's/v//')
           if [[ "$CURRENT" != "$VERSION" ]]; then
             echo "Update: $CURRENT -> $VERSION"
-            curl -L --max-time 300 "https://github.com/AdguardTeam/AdGuardHome/releases/download/v$VERSION/AdGuardHome_linux_amd64.tar.gz" -o AdGuardHome_linux_amd64.tar.gz
+            curl -L --max-time 300 "https://github.com/AdguardTeam/AdGuardHome/releases/download/v${VERSION}/AdGuardHome_linux_amd64.tar.gz" -o AdGuardHome_linux_amd64.tar.gz
             if [[ ! -f "AdGuardHome_linux_amd64.tar.gz" ]] || [[ $(stat -c%s "AdGuardHome_linux_amd64.tar.gz") -lt 10000000 ]]; then
-              echo "Error: File download failed"
+              echo "Error: File download failed or too small"
               exit 1
             fi
-            gh release delete latest --yes || true
+            gh release delete latest --yes 2>/dev/null || true
             gh release create latest \
-              --title "AdGuardHome v$VERSION" \
-              --notes "AdGuardHome v$VERSION Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              --title "AdGuardHome v${VERSION}" \
+              --notes "AdGuardHome v${VERSION} - Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
               AdGuardHome_linux_amd64.tar.gz
+            echo "Successfully released v${VERSION}"
           else
-            echo "Already latest version: v$VERSION"
+            echo "Already latest version: v${VERSION}"
           fi
