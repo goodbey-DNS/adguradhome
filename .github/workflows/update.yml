@@ -84,6 +84,11 @@ jobs:
           LATEST="${{ steps.version.outputs.version }}"
           CURRENT="${{ steps.current.outputs.current }}"
           
+          echo "=== Version Comparison ==="
+          echo "Latest version from official: $LATEST"
+          echo "Current version in repo: $CURRENT"
+          echo "========================="
+          
           if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
             echo "Update needed: $CURRENT → $LATEST"
