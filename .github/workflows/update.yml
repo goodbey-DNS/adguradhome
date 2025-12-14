@@ -1,0 +1,262 @@
+name: AdGuardHome Auto Update
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  REPO: AdguardTeam/AdGuardHome
+  ARCH: linux_amd64  # 可改为 ${{ matrix.arch }}
+  TIMEOUT: 10
+  RETRIES: 3
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: adguard-update
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache API responses
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/api-responses
+          key: api-cache-${{ github.run_id }}
+          restore-keys: api-cache-
+
+      - name: Setup tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl
+          echo "jq version: $(jq --version)"
+          echo "curl version: $(curl --version | head -n1)"
+
+      - name: Check environment
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ secrets.GITHUB_TOKEN }}" ]]; then
+            echo "Error: GITHUB_TOKEN is not available"
+            exit 1
+          fi
+          echo "Environment check passed"
+
+      - name: Get latest version with retry
+        id: version
+        run: |
+          set -euo pipefail
+          get_version() {
+            curl -s --max-time ${{ env.TIMEOUT }} \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" \
+              2>/dev/null | jq -r '.tag_name // empty' | sed 's/v//'
+          }
+          
+          VERSION=""
+          for i in $(seq 1 ${{ env.RETRIES }}); do
+            VERSION=$(get_version)
+            [[ -n "$VERSION" ]] && break
+            echo "Attempt $i failed, retrying..."
+            sleep $((2 ** i))
+          done
+          
+          if [[ -z "$VERSION" ]]; then
+            echo "Error: Cannot get version info after ${{ env.RETRIES }} attempts"
+            exit 1
+          fi
+          
+          echo "Latest version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Get current release
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT=$(curl -s --max-time ${{ env.TIMEOUT }} \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            2>/dev/null | jq -r '.tag_name // "none"' | sed 's/v//')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          set -euo pipefail
+          LATEST="${{ steps.version.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.current }}"
+          
+          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Update needed: $CURRENT → $LATEST"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already latest: v$LATEST"
+          fi
+
+      - name: Download AdGuardHome
+        if: steps.compare.outputs.needs_update == 'true'
+        id: download
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          FILENAME="AdGuardHome_${{ env.ARCH }}.tar.gz"
+          URL="https://github.com/${{ env.REPO }}/releases/download/v${VERSION}/${FILENAME}"
+          
+          echo "Downloading from: $URL"
+          
+          for i in $(seq 1 ${{ env.RETRIES }}); do
+            if curl -L --max-time 300 --retry 2 -o "$FILENAME" "$URL"; then
+              if [[ -f "$FILENAME" ]] && [[ $(stat -c%s "$FILENAME" 2>/dev/null || echo 0) -gt 10000000 ]]; then
+                echo "Download successful"
+                break
+              fi
+            fi
+            
+            if [[ $i -eq ${{ env.RETRIES }} ]]; then
+              echo "Error: Download failed after ${{ env.RETRIES }} attempts"
+              exit 1
+            fi
+            
+            echo "Download attempt $i failed, retrying..."
+            rm -f "$FILENAME"
+            sleep $((2 ** i))
+          done
+          
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Verify download integrity
+        if: steps.download.outputs.filename
+        run: |
+          set -euo pipefail
+          FILENAME="${{ steps.download.outputs.filename }}"
+          
+          echo "Verifying file integrity..."
+          if ! tar -tzf "$FILENAME" >/dev/null 2>&1; then
+            echo "Error: File is not a valid tar.gz archive"
+            exit 1
+          fi
+          
+          SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
+          echo "File size: $SIZE bytes"
+          
+          if [[ $SIZE -lt 10000000 ]]; then
+            echo "Error: File too small (< 10MB)"
+            exit 1
+          fi
+
+      - name: Delete old release
+        if: steps.download.outputs.filename
+        run: |
+          set -euo pipefail
+          if gh release view latest >/dev/null 2>&1; then
+            echo "Deleting existing latest release..."
+            gh release delete latest --yes --cleanup-tag
+          else
+            echo "No existing latest release found"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create new release
+        if: steps.download.outputs.filename
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          
+          if [[ -z "$VERSION" ]]; then
+            echo "Error: Version is empty, cannot create release"
+            exit 1
+          fi
+          
+          if [[ ! -f "$FILENAME" ]]; then
+            echo "Error: File $FILENAME not found"
+            exit 1
+          fi
+          
+          NOTES=$(cat <<EOF
+          ## AdGuardHome v${VERSION}
+          
+          **Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          
+          **Source:** ${{ env.REPO }}
+          
+          **Architecture:** ${{ env.ARCH }}
+          
+          ### Installation
+          \`\`\`bash
+          tar -xzf ${FILENAME}
+          sudo ./AdGuardHome -s install
+          \`\`\`
+          EOF
+          )
+          
+          gh release create latest \
+            --title "AdGuardHome v${VERSION}" \
+            --notes "$NOTES" \
+            "$FILENAME"
+          
+          echo "Release created successfully"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send notification
+        if: always()
+        run: |
+          set -euo pipefail
+          JOB_STATUS="${{ job.status }}"
+          VERSION="${{ steps.version.outputs.version || 'unknown' }}"
+          NEEDS_UPDATE="${{ steps.compare.outputs.needs_update || 'false' }}"
+          
+          case "$JOB_STATUS" in
+            success)
+              if [[ "$NEEDS_UPDATE" == "true" ]] && [[ "$VERSION" != "unknown" ]]; then
+                MESSAGE="✅ AdGuardHome updated to v${VERSION}"
+              elif [[ "$VERSION" != "unknown" ]]; then
+                MESSAGE="✅ AdGuardHome is already up to date (v${VERSION})"
+              else
+                MESSAGE="✅ AdGuardHome update completed"
+              fi
+              ;;
+            failure)
+              MESSAGE="❌ AdGuardHome update failed"
+              ;;
+            cancelled)
+              MESSAGE="⚠️ AdGuardHome update cancelled"
+              ;;
+          esac
+          
+          echo "Notification: $MESSAGE"
+          echo "message=$MESSAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Log execution info
+        if: always()
+        run: |
+          echo "=== Workflow Execution Summary ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Latest Version: ${{ steps.version.outputs.version || 'N/A' }}"
+          echo "Current Version: ${{ steps.current.outputs.current || 'N/A' }}"
+          echo "Needs Update: ${{ steps.compare.outputs.needs_update || 'N/A' }}"
+          echo "Downloaded File: ${{ steps.download.outputs.filename || 'N/A' }}"
+          echo "=================================="
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f AdGuardHome_*.tar.gz
+          echo "Cleanup completed"
