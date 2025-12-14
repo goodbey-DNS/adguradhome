@@ -162,7 +162,8 @@ jobs:
           fi
           
           echo "Final version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # 确保VERSION不包含换行符，使用printf写入GITHUB_OUTPUT
+          printf "version=%s\n" "$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Get current release
         id: current
@@ -274,7 +275,7 @@ jobs:
           fi
           
           echo "Final current version: $CURRENT"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          printf "current=%s\n" "$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Compare versions
         id: compare
@@ -315,7 +316,7 @@ jobs:
           
           # 如果当前版本是none，或者版本号不同，则需要更新
           if [[ "$CURRENT" == "none" ]]; then
-            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            printf "needs_update=%s\n" "true" >> "$GITHUB_OUTPUT"
             echo "Update needed: No current version → $LATEST"
           else
             # 比较版本号，处理比较失败的情况
@@ -326,7 +327,7 @@ jobs:
             
             if ! CURRENT_INT=$(version_to_int "$CURRENT"); then
               echo "Warning: Failed to parse current version: $CURRENT, treating as update needed" >&2
-              echo "needs_update=true" >> "$GITHUB_OUTPUT"
+              printf "needs_update=%s\n" "true" >> "$GITHUB_OUTPUT"
               echo "Update needed: Invalid current version → $LATEST"
               exit 0
             fi
@@ -335,10 +336,10 @@ jobs:
             echo "Current version (numeric): $CURRENT_INT"
             
             if [[ "$LATEST_INT" -gt "$CURRENT_INT" ]]; then
-              echo "needs_update=true" >> "$GITHUB_OUTPUT"
+              printf "needs_update=%s\n" "true" >> "$GITHUB_OUTPUT"
               echo "Update needed: $CURRENT → $LATEST"
             else
-              echo "needs_update=false" >> "$GITHUB_OUTPUT"
+              printf "needs_update=%s\n" "false" >> "$GITHUB_OUTPUT"
               echo "Already latest: v$LATEST"
             fi
           fi
@@ -374,8 +375,8 @@ jobs:
             sleep $((2 ** i))
           done
           
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
+          printf "filename=%s\n" "$FILENAME" >> "$GITHUB_OUTPUT"
+          printf "sha256file=%s\n" "$SHA256SUMS" >> "$GITHUB_OUTPUT"
 
       - name: Verify download integrity
         if: steps.download.outcome == 'success'
