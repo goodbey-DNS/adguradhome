@@ -29,8 +29,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/api-responses
-          key: api-cache-${{ github.run_id }}
-          restore-keys: api-cache-
+          key: api-cache-adguard
+          restore-keys: api-cache-adguard
 
       - name: Setup tools
         run: |
@@ -38,15 +38,6 @@ jobs:
           sudo apt-get install -y -qq jq curl
           echo "jq version: $(jq --version)"
           echo "curl version: $(curl --version | head -n1)"
-
-      - name: Check environment
-        run: |
-          set -euo pipefail
-          if [[ -z "${{ secrets.GITHUB_TOKEN }}" ]]; then
-            echo "Error: GITHUB_TOKEN is not available"
-            exit 1
-          fi
-          echo "Environment check passed"
 
       - name: Get latest version with retry
         id: version
@@ -57,7 +48,7 @@ jobs:
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ env.REPO }}/releases/latest" \
-              2>/dev/null | jq -r '.tag_name // empty' | sed 's/v//'
+              2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//'
           }
           
           VERSION=""
@@ -83,7 +74,7 @@ jobs:
           CURRENT=$(curl -s --max-time ${{ env.TIMEOUT }} \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            2>/dev/null | jq -r '.tag_name // "none"' | sed 's/v//')
+            2>/dev/null | jq -r '.tag_name // "none"' | sed 's/^v//')
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Compare versions
@@ -213,8 +204,10 @@ jobs:
         run: |
           set -euo pipefail
           JOB_STATUS="${{ job.status }}"
-          VERSION="${{ steps.version.outputs.version || 'unknown' }}"
-          NEEDS_UPDATE="${{ steps.compare.outputs.needs_update || 'false' }}"
+          RAW_VERSION="${{ steps.version.outputs.version }}"
+          RAW_NEEDS_UPDATE="${{ steps.compare.outputs.needs_update }}"
+          VERSION="${RAW_VERSION:-unknown}"
+          NEEDS_UPDATE="${RAW_NEEDS_UPDATE:-false}"
           
           case "$JOB_STATUS" in
             success)
@@ -240,6 +233,17 @@ jobs:
       - name: Log execution info
         if: always()
         run: |
+          set -euo pipefail
+          RAW_LATEST_VERSION="${{ steps.version.outputs.version }}"
+          RAW_CURRENT_VERSION="${{ steps.current.outputs.current }}"
+          RAW_NEEDS_UPDATE="${{ steps.compare.outputs.needs_update }}"
+          RAW_DOWNLOADED_FILE="${{ steps.download.outputs.filename }}"
+          
+          LATEST_VERSION="${RAW_LATEST_VERSION:-N/A}"
+          CURRENT_VERSION="${RAW_CURRENT_VERSION:-N/A}"
+          NEEDS_UPDATE_STATUS="${RAW_NEEDS_UPDATE:-N/A}"
+          DOWNLOADED_FILE="${RAW_DOWNLOADED_FILE:-N/A}"
+          
           echo "=== Workflow Execution Summary ==="
           echo "Repository: ${{ github.repository }}"
           echo "Run ID: ${{ github.run_id }}"
@@ -249,10 +253,10 @@ jobs:
           echo "Branch: ${{ github.ref }}"
           echo "Commit: ${{ github.sha }}"
           echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "Latest Version: ${{ steps.version.outputs.version || 'N/A' }}"
-          echo "Current Version: ${{ steps.current.outputs.current || 'N/A' }}"
-          echo "Needs Update: ${{ steps.compare.outputs.needs_update || 'N/A' }}"
-          echo "Downloaded File: ${{ steps.download.outputs.filename || 'N/A' }}"
+          echo "Latest Version: $LATEST_VERSION"
+          echo "Current Version: $CURRENT_VERSION"
+          echo "Needs Update: $NEEDS_UPDATE_STATUS"
+          echo "Downloaded File: $DOWNLOADED_FILE"
           echo "=================================="
 
       - name: Cleanup
