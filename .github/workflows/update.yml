@@ -70,19 +70,27 @@ jobs:
         run: |
           set -euo pipefail
           get_version() {
-            # 使用-i参数获取响应头，-s参数隐藏进度信息
-            RESPONSE=$(curl -s -i --max-time ${{ env.TIMEOUT }} \
+            echo "=== Debug: Starting API request ==="
+            
+            # 使用独立的curl命令获取响应头
+            HTTP_RESPONSE=$(curl -s -I --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>&1)
             
-            # 分离响应头和响应体
-            HTTP_CODE=$(echo "$RESPONSE" | grep "^HTTP/" | awk '{print $2}')
+            echo "=== Debug: Response headers ==="
+            echo "$HTTP_RESPONSE"
             
+            # 提取HTTP状态码
+            HTTP_CODE=$(echo "$HTTP_RESPONSE" | grep "^HTTP/" | awk '{print $2}')
+            echo "=== Debug: HTTP_CODE = $HTTP_CODE ==="
+            
+            # 检查限流
             if [[ "$HTTP_CODE" == "403" ]]; then
-              RATE_LIMIT=$(echo "$RESPONSE" | grep -i "^x-ratelimit-remaining:" | awk '{print $2}' | tr -d '\r')
-              RATE_RESET=$(echo "$RESPONSE" | grep -i "^x-ratelimit-reset:" | awk '{print $2}' | tr -d '\r')
-              if [[ "$RATE_LIMIT" == "0" ]] && [[ -n "$RATE_RESET" ]]; then
+              RATE_LIMIT=$(echo "$HTTP_RESPONSE" | grep -i "^x-ratelimit-remaining:" | awk '{print $2}' | tr -d '\r')
+              RATE_RESET=$(echo "$HTTP_RESPONSE" | grep -i "^x-ratelimit-reset:" | awk '{print $2}' | tr -d '\r')
+              echo "=== Debug: RATE_LIMIT = ${RATE_LIMIT:-unknown}, RATE_RESET = ${RATE_RESET:-unknown} ==="
+              if [[ "${RATE_LIMIT:-0}" == "0" ]] && [[ -n "$RATE_RESET" ]]; then
                 RESET_TIME=$(date -d "@$RATE_RESET" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "unknown")
                 echo "Error: GitHub API rate limit exceeded. Resets at: $RESET_TIME" >&2
                 return 1
@@ -91,19 +99,61 @@ jobs:
             
             if [[ "$HTTP_CODE" != "200" ]]; then
               echo "Error: API returned HTTP $HTTP_CODE" >&2
+echo "=== Debug: Full response headers ===" >&2
+n              echo "$HTTP_RESPONSE" >&2
               return 1
             fi
             
-            # 提取响应体（从第一个空行之后）
-            echo "$RESPONSE" | sed '1,/^$/d' | jq -r '.tag_name // empty' | sed 's/^v//'
+            # 获取响应体（独立的请求）
+            echo "=== Debug: Fetching response body ==="
+            RESPONSE_BODY=$(curl -s --max-time ${{ env.TIMEOUT }} \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>&1)
+            
+            echo "=== Debug: Response body (first 200 chars) ==="
+            echo "${RESPONSE_BODY:0:200}"
+            
+            # 使用jq提取tag_name
+            if ! TAG_NAME=$(echo "$RESPONSE_BODY" | jq -r '.tag_name // empty' 2>/dev/null); then
+              echo "Error: Failed to parse JSON response" >&2
+              echo "=== Debug: Invalid JSON ===" >&2
+              echo "$RESPONSE_BODY" >&2
+              return 1
+            fi
+            
+            if [[ -z "$TAG_NAME" ]]; then
+              echo "Error: No tag_name found in response" >&2
+              echo "=== Debug: Available fields ===" >&2
+              echo "$RESPONSE_BODY" | jq -r 'keys[]' 2>/dev/null || echo "Failed to list keys" >&2
+              return 1
+            fi
+            
+            # 移除v前缀
+            VERSION=$(echo "$TAG_NAME" | sed 's/^v//')
+            echo "=== Debug: Extracted version = $VERSION ==="
+            
+            if [[ -z "$VERSION" ]]; then
+              echo "Error: Version is empty after processing tag_name: $TAG_NAME" >&2
+              return 1
+            fi
+            
+            echo "$VERSION"
+            return 0
           }
           
           VERSION=""
           for i in $(seq 1 ${{ env.RETRIES }}); do
-            VERSION=$(get_version)
-            [[ -n "$VERSION" ]] && break
-            echo "Attempt $i failed, retrying..."
-            sleep $((2 ** i))
+            echo "=== Attempt $i of ${{ env.RETRIES }} ==="
+            if VERSION=$(get_version); then
+              echo "Successfully got version: $VERSION"
+              break
+            fi
+            echo "Attempt $i failed"
+            if [[ $i -lt ${{ env.RETRIES }} ]]; then
+              echo "Waiting $((2 ** i)) seconds before retry..."
+              sleep $((2 ** i))
+            fi
           done
           
           if [[ -z "$VERSION" ]]; then
@@ -111,7 +161,7 @@ jobs:
             exit 1
           fi
           
-          echo "Latest version: $VERSION"
+          echo "Final version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Get current release
@@ -119,19 +169,27 @@ jobs:
         run: |
           set -euo pipefail
           get_current_version() {
-            # 使用-i参数获取响应头
-            RESPONSE=$(curl -s -i --max-time ${{ env.TIMEOUT }} \
+            echo "=== Debug: Starting API request for current release ==="
+            
+            # 使用独立的curl命令获取响应头
+            HTTP_RESPONSE=$(curl -s -I --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>&1)
             
-            # 分离响应头和响应体
-            HTTP_CODE=$(echo "$RESPONSE" | grep "^HTTP/" | awk '{print $2}')
+            echo "=== Debug: Response headers ==="
+            echo "$HTTP_RESPONSE"
             
+            # 提取HTTP状态码
+            HTTP_CODE=$(echo "$HTTP_RESPONSE" | grep "^HTTP/" | awk '{print $2}')
+            echo "=== Debug: HTTP_CODE = $HTTP_CODE ==="
+            
+            # 检查限流
             if [[ "$HTTP_CODE" == "403" ]]; then
-              RATE_LIMIT=$(echo "$RESPONSE" | grep -i "^x-ratelimit-remaining:" | awk '{print $2}' | tr -d '\r')
-              RATE_RESET=$(echo "$RESPONSE" | grep -i "^x-ratelimit-reset:" | awk '{print $2}' | tr -d '\r')
-              if [[ "$RATE_LIMIT" == "0" ]] && [[ -n "$RATE_RESET" ]]; then
+              RATE_LIMIT=$(echo "$HTTP_RESPONSE" | grep -i "^x-ratelimit-remaining:" | awk '{print $2}' | tr -d '\r')
+              RATE_RESET=$(echo "$HTTP_RESPONSE" | grep -i "^x-ratelimit-reset:" | awk '{print $2}' | tr -d '\r')
+              echo "=== Debug: RATE_LIMIT = ${RATE_LIMIT:-unknown}, RATE_RESET = ${RATE_RESET:-unknown} ==="
+              if [[ "${RATE_LIMIT:-0}" == "0" ]] && [[ -n "$RATE_RESET" ]]; then
                 RESET_TIME=$(date -d "@$RATE_RESET" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "unknown")
                 echo "Error: GitHub API rate limit exceeded. Resets at: $RESET_TIME" >&2
                 return 1
@@ -140,31 +198,74 @@ jobs:
             
             if [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "404" ]]; then
               echo "Error: API returned HTTP $HTTP_CODE" >&2
+              echo "=== Debug: Full response headers ===" >&2
+              echo "$HTTP_RESPONSE" >&2
               return 1
             fi
             
-            # 提取响应体（从第一个空行之后）
-            # 提取版本号并验证格式
-            VERSION=$(echo "$RESPONSE" | sed '1,/^$/d' | jq -r '.tag_name // "none"' | sed 's/^v//')
+            # 获取响应体（独立的请求）
+            echo "=== Debug: Fetching response body ==="
+            RESPONSE_BODY=$(curl -s --max-time ${{ env.TIMEOUT }} \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>&1)
             
-            # 验证版本号格式（如果不是none）
-            if [[ "$VERSION" != "none" ]] && ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
-              echo "Warning: Invalid version format detected: $VERSION" >&2
-              echo "none"  # 返回none而不是无效版本
-            else
-              echo "$VERSION"
+            if [[ "$HTTP_CODE" == "404" ]]; then
+              echo "No current release found (404), using 'none'"
+              echo "none"
+              return 0
             fi
+            
+            echo "=== Debug: Response body (first 200 chars) ==="
+            echo "${RESPONSE_BODY:0:200}"
+            
+            # 使用jq提取tag_name
+            if ! TAG_NAME=$(echo "$RESPONSE_BODY" | jq -r '.tag_name // "none"' 2>/dev/null); then
+              echo "Error: Failed to parse JSON response" >&2
+              echo "=== Debug: Invalid JSON ===" >&2
+              echo "$RESPONSE_BODY" >&2
+              return 1
+            fi
+            
+            if [[ "$TAG_NAME" == "null" ]] || [[ -z "$TAG_NAME" ]] || [[ "$TAG_NAME" == "none" ]]; then
+              echo "No tag_name found in response, using 'none'"
+              echo "none"
+              return 0
+            fi
+            
+            # 移除v前缀
+            VERSION=$(echo "$TAG_NAME" | sed 's/^v//')
+            echo "=== Debug: Extracted version = $VERSION ==="
+            
+            if [[ -z "$VERSION" ]]; then
+              echo "Warning: Version is empty after processing tag_name: $TAG_NAME, using 'none'" >&2
+              echo "none"
+              return 0
+            fi
+            
+            # 验证版本号格式
+            if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+              echo "Warning: Invalid version format detected: $VERSION, using 'none'" >&2
+              echo "none"
+              return 0
+            fi
+            
+            echo "$VERSION"
+            return 0
           }
           
           CURRENT=""
           for i in $(seq 1 ${{ env.RETRIES }}); do
-            CURRENT=$(get_current_version)
-            if [[ -n "$CURRENT" ]]; then
-              echo "Successfully retrieved current version: $CURRENT"
+            echo "=== Attempt $i of ${{ env.RETRIES }} ==="
+            if CURRENT=$(get_current_version); then
+              echo "Successfully got current version: $CURRENT"
               break
             fi
-            echo "Attempt $i failed, retrying..."
-            sleep $((2 ** i))
+            echo "Attempt $i failed"
+            if [[ $i -lt ${{ env.RETRIES }} ]]; then
+              echo "Waiting $((2 ** i)) seconds before retry..."
+              sleep $((2 ** i))
+            fi
           done
           
           if [[ -z "$CURRENT" ]]; then
@@ -172,6 +273,7 @@ jobs:
             CURRENT="none"
           fi
           
+          echo "Final current version: $CURRENT"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Compare versions
