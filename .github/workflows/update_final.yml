@@ -1,0 +1,225 @@
+name: ${{ vars.WORKFLOW_NAME || 'AdGuardHome Auto Update' }}
+on:
+  schedule:
+    - cron: '${{ vars.SCHEDULE || '0 8 * * *' }}'
+  workflow_dispatch:
+permissions:
+  contents: ${{ vars.PERMISSIONS_CONTENTS || 'read' }}
+  releases: ${{ vars.PERMISSIONS_RELEASES || 'write' }}
+jobs:
+  update:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: ${{ vars.TIMEOUT_MINUTES || 10 }}
+    env:
+      ENVIRONMENT: ${{ vars.ENVIRONMENT || 'production' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup dependencies
+        run: |
+          # 安装yq工具（如果需要）
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "Installing yq for YAML processing..."
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+        
+      - name: Load configuration
+        run: |
+          # 加载配置系统
+          source ./scripts/config.sh
+          
+          # 初始化配置
+          if ! init_config_system; then
+            echo "Error: Failed to initialize configuration"
+            exit 1
+          fi
+          
+          echo "Configuration loaded successfully"
+          echo "Environment: $ENVIRONMENT"
+          echo "Log Level: ${LOG_LEVEL:-INFO}"
+          echo "Verbose Logging: ${VERBOSE_LOGGING:-false}"
+        
+      - name: Get latest version
+        id: version
+        run: |
+          # 加载所有脚本库
+          source ./scripts/config.sh
+          source ./scripts/common.sh
+          source ./scripts/security.sh
+          
+          # 初始化配置和安全环境
+          init_config_system
+          init_secure_environment
+          
+          log_update_event "INFO" "Starting secure version check"
+          log_update_event "INFO" "Using configuration: $GITHUB_API_BASE, $ADGUARD_REPO"
+          
+          # 使用配置的API URL获取最新版本
+          local api_url="$GITHUB_API_BASE/repos/$ADGUARD_REPO/releases/latest"
+          
+          if ! secure_retry_with_backoff curl_with_retry \
+            "$api_url" "/tmp/latest_release.json" "$DEFAULT_TIMEOUT"; then
+            log_update_event "ERROR" "Failed to fetch latest version"
+            exit 1
+          fi
+          
+          # 验证JSON安全性
+          if ! validate_json_security "/tmp/latest_release.json"; then
+            log_update_event "ERROR" "Security validation failed for version response"
+            exit 1
+          fi
+          
+          # 解析版本号
+          RAW_VERSION=$(jq -r '.tag_name' "/tmp/latest_release.json" 2>/dev/null || echo "")
+          VERSION=$(clean_version "$RAW_VERSION")
+          
+          # 验证版本格式
+          if ! validate_version "$VERSION"; then
+            log_update_event "ERROR" "Invalid version format: $VERSION"
+            exit 1
+          fi
+          
+          if [[ -z "$VERSION" ]]; then
+            log_update_event "ERROR" "Cannot get version info"
+            exit 1
+          fi
+          
+          log_update_event "SUCCESS" "Latest version: $VERSION"
+          
+          # 输出版本信息
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "raw_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+          
+          # 保存版本信息供后续步骤使用
+          cp "/tmp/latest_release.json" "/tmp/latest_release_final.json" 2>/dev/null || true
+        
+      - name: Check and update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 加载所有脚本库
+          source ./scripts/config.sh
+          source ./scripts/common.sh
+          source ./scripts/security.sh
+          
+          # 重新初始化配置
+          init_config_system
+          
+          # 获取版本号
+          VERSION="${{ steps.version.outputs.version }}"
+          RAW_VERSION="${{ steps.version.outputs.raw_version }}"
+          
+          log_update_event "INFO" "Checking for updates, target version: $VERSION"
+          
+          # 验证版本变量
+          if [[ -z "$VERSION" ]]; then
+            log_update_event "ERROR" "Version variable is empty"
+            exit 1
+          fi
+          
+          # 获取当前版本
+          CURRENT="0.0.0"
+          local current_api_url="$GITHUB_API_BASE/repos/${{ github.repository }}/releases/latest"
+          
+          if secure_retry_with_backoff curl_with_retry \
+            "$current_api_url" "/tmp/current_release.json" "$DEFAULT_TIMEOUT"; then
+            
+            # 验证当前版本响应安全性
+            if validate_json_security "/tmp/current_release.json"; then
+              CURRENT_RAW=$(jq -r '.tag_name' "/tmp/current_release.json" 2>/dev/null || echo "")
+              
+              if [[ -n "$CURRENT_RAW" ]] && [[ "$CURRENT_RAW" != "null" ]]; then
+                CURRENT=$(clean_version "$CURRENT_RAW")
+                
+                if ! validate_version "$CURRENT" 2>/dev/null; then
+                  log_update_event "WARNING" "Current version invalid: $CURRENT_RAW"
+                  CURRENT="0.0.0"
+                fi
+              else
+                log_update_event "WARNING" "Current version tag is null or empty"
+                CURRENT="0.0.0"
+              fi
+            else
+              log_update_event "WARNING" "Security validation failed for current version"
+              CURRENT="0.0.0"
+            fi
+          else
+            log_update_event "WARNING" "Failed to fetch current version, assuming first release"
+            CURRENT="0.0.0"
+          fi
+          
+          # 使用语义化版本比较
+          version_comparison=$(compare_versions "$CURRENT" "$VERSION")
+          
+          if [[ "$version_comparison" != "equal" ]]; then
+            log_update_event "INFO" "Update needed: $CURRENT -> $VERSION (comparison: $version_comparison)"
+            
+            # 构建下载URL
+            local download_url="https://github.com/$ADGUARD_REPO/releases/download/v${VERSION}/AdGuardHome_linux_amd64.tar.gz"
+            
+            # 验证URL安全性
+            if ! validate_url_security "$download_url"; then
+              log_update_event "ERROR" "Download URL security validation failed"
+              exit 1
+            fi
+            
+            log_update_event "INFO" "Downloading from: $download_url"
+            
+            # 使用配置的超时时间下载文件
+            if ! secure_retry_with_backoff curl_with_retry \
+              "$download_url" "AdGuardHome_linux_amd64.tar.gz" "$DOWNLOAD_TIMEOUT"; then
+              log_update_event "ERROR" "Failed to download AdGuardHome v${VERSION}"
+              exit 1
+            fi
+            
+            # 使用配置的文件大小验证
+            if ! verify_file_integrity "AdGuardHome_linux_amd64.tar.gz" "$MIN_FILE_SIZE"; then
+              log_update_event "ERROR" "File integrity check failed"
+              exit 1
+            fi
+            
+            # 额外的安全验证
+            if ! validate_file_security "AdGuardHome_linux_amd64.tar.gz" "$MAX_FILE_SIZE"; then
+              log_update_event "ERROR" "File security validation failed"
+              exit 1
+            fi
+            
+            log_update_event "INFO" "File downloaded and verified successfully"
+            
+            # 检查gh命令是否可用
+            if ! command -v gh >/dev/null 2>&1; then
+              log_update_event "ERROR" "gh command not found"
+              exit 1
+            fi
+            
+            # 检查GITHUB_TOKEN是否设置
+            if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+              log_update_event "ERROR" "GITHUB_TOKEN is not set"
+              exit 1
+            fi
+            
+            # 删除旧release并创建新release
+            gh release delete latest --yes 2>/dev/null || true
+            
+            local release_notes="AdGuardHome v${VERSION} - Update time: $(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo 'TIME_ERROR')"
+            release_notes+=" - Environment: $ENVIRONMENT"
+            
+            if gh release create latest \
+              --title "AdGuardHome v${VERSION}" \
+              --notes "$release_notes" \
+              AdGuardHome_linux_amd64.tar.gz; then
+              log_update_event "SUCCESS" "Successfully released v${VERSION}"
+            else
+              log_update_event "ERROR" "Failed to create release"
+              exit 1
+            fi
+          else
+            log_update_event "INFO" "Already latest version: v${VERSION}"
+          fi
+          
+          # 执行安全清理
+          secure_cleanup
+          
+          log_update_event "INFO" "Update process completed successfully"
