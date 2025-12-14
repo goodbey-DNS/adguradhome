@@ -1,0 +1,144 @@
+# AdGuardHome 自动更新工作流配置文件
+
+# =============================================================================
+# API 配置
+# =============================================================================
+api:
+  # GitHub API 基础URL
+  base_url: "https://api.github.com"
+  # AdGuardHome 仓库路径
+  adguard_repo: "AdguardTeam/AdGuardHome"
+  # 默认超时时间（秒）
+  default_timeout: 10
+  # 下载超时时间（秒）
+  download_timeout: 300
+  # 最大重试次数
+  max_retries: 3
+  # 重试基础延迟（秒）
+  base_retry_delay: 5
+
+# =============================================================================
+# 文件配置
+# =============================================================================
+files:
+  # 最大文件大小（字节，50MB）
+  max_file_size: 52428800
+  # 最小文件大小（字节，10MB）
+  min_file_size: 10000000
+  # 临时文件目录
+  temp_dir: "/tmp"
+  # 锁文件路径
+  lock_file: "/tmp/adguard_update.lock"
+  # 临时文件模式
+  temp_file_pattern: "adguard_update_*"
+
+# =============================================================================
+# 安全配置
+# =============================================================================
+security:
+  # 允许的域名列表
+  allowed_domains:
+    - "github.com"
+    - "api.github.com"
+    - "objects.githubusercontent.com"
+  # 允许的文件类型
+  allowed_mime_types:
+    - "application/gzip"
+    - "application/x-gzip"
+    - "application/octet-stream"
+  # 最大API调用频率（每分钟）
+  max_api_calls_per_minute: 30
+  # API调用间隔（秒）
+  api_call_delay: 2
+  # 锁文件超时时间（秒，30分钟）
+  lock_timeout: 1800
+  # 锁等待最大时间（秒，5分钟）
+  lock_max_wait: 300
+  # 锁检查间隔（秒）
+  lock_check_interval: 5
+
+# =============================================================================
+# 版本管理配置
+# =============================================================================
+version:
+  # 版本格式正则表达式
+  format_regex: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+  # 是否启用语义化版本比较
+  semantic_comparison: true
+  # 版本比较模式（string, semantic）
+  comparison_mode: "semantic"
+
+# =============================================================================
+# 工作流配置
+# =============================================================================
+workflow:
+  # 工作流名称
+  name: "AdGuardHome Auto Update"
+  # 工作流超时时间（分钟）
+  timeout_minutes: 10
+  # 定时执行时间（cron格式）
+  schedule: "0 8 * * *"
+  # 是否启用手动触发
+  manual_dispatch: true
+  # 运行环境
+  runs_on: "ubuntu-latest"
+
+# =============================================================================
+# 权限配置
+# =============================================================================
+permissions:
+  contents: "read"
+  releases: "write"
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  # 日志级别（DEBUG, INFO, WARNING, ERROR）
+  level: "INFO"
+  # 时间戳格式
+  timestamp_format: "%Y-%m-%d %H:%M:%S UTC"
+  # 是否启用详细日志
+  verbose: false
+
+# =============================================================================
+# 通知配置（预留）
+# =============================================================================
+notifications:
+  # 是否启用通知
+  enabled: false
+  # 通知方式（email, slack, teams等）
+  methods: []
+  # 通知条件（success, failure, always）
+  conditions: []
+
+# =============================================================================
+# 环境特定配置
+# =============================================================================
+environments:
+  # 生产环境配置
+  production:
+    logging:
+      level: "INFO"
+      verbose: false
+    security:
+      max_api_calls_per_minute: 30
+      api_call_delay: 2
+  
+  # 测试环境配置
+  testing:
+    logging:
+      level: "DEBUG"
+      verbose: true
+    security:
+      max_api_calls_per_minute: 60
+      api_call_delay: 1
+  
+  # 开发环境配置
+  development:
+    logging:
+      level: "DEBUG"
+      verbose: true
+    security:
+      max_api_calls_per_minute: 120
+      api_call_delay: 0
