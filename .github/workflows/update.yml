@@ -10,7 +10,7 @@ permissions:
 
 env:
   REPO: AdguardTeam/AdGuardHome
-  ARCH: linux_amd64  # 可改为 ${{ matrix.arch }}
+  ARCH: linux_amd64  # 仅支持AMD64架构，个人使用无需其他架构
   TIMEOUT: 10
   RETRIES: 3
 
@@ -29,13 +29,39 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/api-responses
-          key: api-cache-adguard
-          restore-keys: api-cache-adguard
+          key: api-cache-adguard-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            api-cache-adguard-${{ runner.os }}-
+
+      - name: Validate environment
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ secrets.GITHUB_TOKEN }}" ]]; then
+            echo "Error: GITHUB_TOKEN is not set"
+            exit 1
+          fi
+          if [[ -z "${{ env.REPO }}" ]]; then
+            echo "Error: REPO environment variable is not set"
+            exit 1
+          fi
+          echo "Environment validation passed"
 
       - name: Setup tools
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl
+          
+          if ! command -v jq &> /dev/null; then
+            echo "Error: jq is not installed"
+            exit 1
+          fi
+          
+          if ! command -v curl &> /dev/null; then
+            echo "Error: curl is not installed"
+            exit 1
+          fi
+          
           echo "jq version: $(jq --version)"
           echo "curl version: $(curl --version | head -n1)"
 
@@ -44,11 +70,27 @@ jobs:
         run: |
           set -euo pipefail
           get_version() {
-            curl -s --max-time ${{ env.TIMEOUT }} \
+            RESPONSE=$(curl -s --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" \
-              2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//'
+              -w "\n%{http_code}\n%{x-ratelimit-remaining}\n%{x-ratelimit-reset}" \
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>&1)
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -3 | head -1)
+            RATE_LIMIT=$(echo "$RESPONSE" | tail -2 | head -1)
+            RATE_RESET=$(echo "$RESPONSE" | tail -1)
+            
+            if [[ "$HTTP_CODE" == "403" ]] && [[ "$RATE_LIMIT" == "0" ]]; then
+              echo "Error: GitHub API rate limit exceeded. Resets at: $RATE_RESET" >&2
+              return 1
+            fi
+            
+            if [[ "$HTTP_CODE" != "200" ]]; then
+              echo "Error: API returned HTTP $HTTP_CODE" >&2
+              return 1
+            fi
+            
+            echo "$RESPONSE" | head -n -3 | jq -r '.tag_name // empty' | sed 's/^v//'
           }
           
           VERSION=""
@@ -71,16 +113,86 @@ jobs:
         id: current
         run: |
           set -euo pipefail
-          CURRENT=$(curl -s --max-time ${{ env.TIMEOUT }} \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            2>/dev/null | jq -r '.tag_name // "none"' | sed 's/^v//')
+          get_current_version() {
+            RESPONSE=$(curl -s --max-time ${{ env.TIMEOUT }} \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -w "\n%{http_code}\n%{x-ratelimit-remaining}\n%{x-ratelimit-reset}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>&1)
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -3 | head -1)
+            RATE_LIMIT=$(echo "$RESPONSE" | tail -2 | head -1)
+            RATE_RESET=$(echo "$RESPONSE" | tail -1)
+            
+            if [[ "$HTTP_CODE" == "403" ]] && [[ "$RATE_LIMIT" == "0" ]]; then
+              echo "Error: GitHub API rate limit exceeded. Resets at: $RATE_RESET" >&2
+              return 1
+            fi
+            
+            if [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "404" ]]; then
+              echo "Error: API returned HTTP $HTTP_CODE" >&2
+              return 1
+            fi
+            
+            # 提取版本号并验证格式
+            VERSION=$(echo "$RESPONSE" | head -n -3 | jq -r '.tag_name // "none"' | sed 's/^v//')
+            
+            # 验证版本号格式（如果不是none）
+            if [[ "$VERSION" != "none" ]] && ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+              echo "Warning: Invalid version format detected: $VERSION" >&2
+              echo "none"  # 返回none而不是无效版本
+            else
+              echo "$VERSION"
+            fi
+          }
+          
+          CURRENT=""
+          for i in $(seq 1 ${{ env.RETRIES }}); do
+            CURRENT=$(get_current_version)
+            if [[ -n "$CURRENT" ]]; then
+              echo "Successfully retrieved current version: $CURRENT"
+              break
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep $((2 ** i))
+          done
+          
+          if [[ -z "$CURRENT" ]]; then
+            echo "Warning: Cannot get current version info after ${{ env.RETRIES }} attempts, using 'none'"
+            CURRENT="none"
+          fi
+          
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Compare versions
         id: compare
         run: |
           set -euo pipefail
+          
+          # 版本号比较函数（增强健壮性，支持2-4段版本号）
+          version_to_int() {
+            local version="$1"
+            # 移除v前缀
+            version="${version#v}"
+            # 验证版本号格式（基本检查）
+            if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+              echo "Error: Invalid version format: $version" >&2
+              return 1
+            fi
+            # 将版本号转换为可比较的整数（支持2-4段，不足4段的补0）
+            IFS='.' read -r -a parts <<< "$version"
+            # 确保至少有4个部分，不足则补0
+            while [[ ${#parts[@]} -lt 4 ]]; do
+              parts+=(0)
+            done
+            # 只取前4部分，每部分最多6位数字防止溢出
+            printf "%06d%06d%06d%06d" \
+              "$((${parts[0]:-0} > 999999 ? 999999 : ${parts[0]:-0}))" \
+              "$((${parts[1]:-0} > 999999 ? 999999 : ${parts[1]:-0}))" \
+              "$((${parts[2]:-0} > 999999 ? 999999 : ${parts[2]:-0}))" \
+              "$((${parts[3]:-0} > 999999 ? 999999 : ${parts[3]:-0}))"
+          }
+          
           LATEST="${{ steps.version.outputs.version }}"
           CURRENT="${{ steps.current.outputs.current }}"
           
@@ -89,12 +201,34 @@ jobs:
           echo "Current version in repo: $CURRENT"
           echo "========================="
           
-          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
+          # 如果当前版本是none，或者版本号不同，则需要更新
+          if [[ "$CURRENT" == "none" ]]; then
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "Update needed: $CURRENT → $LATEST"
+            echo "Update needed: No current version → $LATEST"
           else
-            echo "needs_update=false" >> "$GITHUB_OUTPUT"
-            echo "Already latest: v$LATEST"
+            # 比较版本号，处理比较失败的情况
+            if ! LATEST_INT=$(version_to_int "$LATEST"); then
+              echo "Error: Failed to parse latest version: $LATEST" >&2
+              exit 1
+            fi
+            
+            if ! CURRENT_INT=$(version_to_int "$CURRENT"); then
+              echo "Warning: Failed to parse current version: $CURRENT, treating as update needed" >&2
+              echo "needs_update=true" >> "$GITHUB_OUTPUT"
+              echo "Update needed: Invalid current version → $LATEST"
+              exit 0
+            fi
+            
+            echo "Latest version (numeric): $LATEST_INT"
+            echo "Current version (numeric): $CURRENT_INT"
+            
+            if [[ "$LATEST_INT" -gt "$CURRENT_INT" ]]; then
+              echo "needs_update=true" >> "$GITHUB_OUTPUT"
+              echo "Update needed: $CURRENT → $LATEST"
+            else
+              echo "needs_update=false" >> "$GITHUB_OUTPUT"
+              echo "Already latest: v$LATEST"
+            fi
           fi
 
       - name: Download AdGuardHome
@@ -104,13 +238,15 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="AdGuardHome_${{ env.ARCH }}.tar.gz"
-          URL="https://github.com/${{ env.REPO }}/releases/download/v${VERSION}/${FILENAME}"
+          SHA256SUMS="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
+          BASE_URL="https://github.com/${{ env.REPO }}/releases/download/v${VERSION}"
           
-          echo "Downloading from: $URL"
+          echo "Downloading from: $BASE_URL"
           
           for i in $(seq 1 ${{ env.RETRIES }}); do
-            if curl -L --max-time 300 --retry 2 -o "$FILENAME" "$URL"; then
-              if [[ -f "$FILENAME" ]] && [[ $(stat -c%s "$FILENAME" 2>/dev/null || echo 0) -gt 10000000 ]]; then
+            if curl -L --max-time 300 --retry 2 -o "$FILENAME" "${BASE_URL}/${FILENAME}" && \
+               curl -L --max-time 30 --retry 2 -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}"; then
+              if [[ -f "$FILENAME" ]] && [[ -f "$SHA256SUMS" ]]; then
                 echo "Download successful"
                 break
               fi
@@ -122,21 +258,62 @@ jobs:
             fi
             
             echo "Download attempt $i failed, retrying..."
-            rm -f "$FILENAME"
+            rm -f "$FILENAME" "$SHA256SUMS"
             sleep $((2 ** i))
           done
           
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
 
       - name: Verify download integrity
         if: steps.download.outputs.filename
         run: |
           set -euo pipefail
           FILENAME="${{ steps.download.outputs.filename }}"
+          SHA256FILE="${{ steps.download.outputs.sha256file }}"
           
           echo "Verifying file integrity..."
+          
+          if [[ ! -f "$SHA256FILE" ]]; then
+            echo "Error: SHA256 checksum file not found"
+            exit 1
+          fi
+          
+          if [[ ! -f "$FILENAME" ]]; then
+            echo "Error: Downloaded file not found"
+            exit 1
+          fi
+          
+          echo "Verifying SHA256 checksum..."
+          # 读取预期的SHA256值（处理不同格式的sha256文件）
+          EXPECTED_SHA=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
+          
+          if [[ -z "$EXPECTED_SHA" ]]; then
+            echo "Error: Could not extract SHA256 from checksum file"
+            exit 1
+          fi
+          
+          # 计算实际的SHA256
+          ACTUAL_SHA=$(sha256sum "$FILENAME" | awk '{print $1}')
+          
+          if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+            echo "Error: SHA256 checksum verification failed"
+            echo "Expected: $EXPECTED_SHA"
+            echo "Actual: $ACTUAL_SHA"
+            exit 1
+          fi
+          
+          echo "SHA256 verification passed"
+          
+          echo "Verifying archive structure..."
           if ! tar -tzf "$FILENAME" >/dev/null 2>&1; then
             echo "Error: File is not a valid tar.gz archive"
+            exit 1
+          fi
+          
+          # 检查是否包含AdGuardHome可执行文件
+          if ! tar -tzf "$FILENAME" | grep -qE '(^|/)AdGuardHome$'; then
+            echo "Error: Archive does not contain AdGuardHome executable"
             exit 1
           fi
           
@@ -147,16 +324,37 @@ jobs:
             echo "Error: File too small (< 10MB)"
             exit 1
           fi
+          
+          echo "Integrity verification passed"
 
       - name: Delete old release
         if: steps.download.outputs.filename
         run: |
           set -euo pipefail
-          if gh release view latest >/dev/null 2>&1; then
-            echo "Deleting existing latest release..."
-            gh release delete latest --yes --cleanup-tag
-          else
+          
+          # 检查release是否存在
+          if ! gh release view latest >/dev/null 2>&1; then
             echo "No existing latest release found"
+            exit 0
+          fi
+          
+          echo "Deleting existing latest release..."
+          
+          # 尝试删除release，如果失败则检查原因
+          DELETE_OUTPUT=$(gh release delete latest --yes --cleanup-tag 2>&1)
+          DELETE_EXIT_CODE=$?
+          
+          if [[ $DELETE_EXIT_CODE -eq 0 ]]; then
+            echo "Old release deleted successfully"
+          else
+            # 检查是否因为release不存在而失败（可能已被其他进程删除）
+            if echo "$DELETE_OUTPUT" | grep -q "release not found\|HTTP 404"; then
+              echo "Release already deleted by another process"
+            else
+              echo "Warning: Failed to delete old release: $DELETE_OUTPUT" >&2
+              echo "This may cause issues when creating new release"
+              # 不退出，继续执行，但记录警告
+            fi
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,6 +376,23 @@ jobs:
             exit 1
           fi
           
+          # 创建发布前备份标签（用于回滚）
+          BACKUP_TAG="backup-latest-$(date +%Y%m%d-%H%M%S)"
+          
+          # 检查latest标签是否存在，存在则创建备份
+          if git rev-parse -q --verify "refs/tags/latest" >/dev/null 2>&1; then
+            echo "Latest tag exists, creating backup tag: $BACKUP_TAG"
+            # 获取latest标签指向的commit
+            LATEST_COMMIT=$(git rev-parse latest)
+            if git tag "$BACKUP_TAG" "$LATEST_COMMIT" 2>/dev/null; then
+              echo "Backup tag created successfully"
+            else
+              echo "Warning: Failed to create backup tag, continuing anyway..."
+            fi
+          else
+            echo "No existing latest tag found, no backup needed"
+          fi
+          
           NOTES=$(cat <<EOF
           ## AdGuardHome v${VERSION}
           
@@ -192,13 +407,27 @@ jobs:
           tar -xzf ${FILENAME}
           sudo ./AdGuardHome -s install
           \`\`\`
+          
+          ### Verification
+          SHA256: $(sha256sum "$FILENAME" | cut -d' ' -f1)
           EOF
           )
           
-          gh release create latest \
+          echo "Creating release with notes:"
+          echo "$NOTES"
+          
+          if ! gh release create latest \
             --title "AdGuardHome v${VERSION}" \
             --notes "$NOTES" \
-            "$FILENAME"
+            "$FILENAME"; then
+            echo "Error: Failed to create release"
+            # 仅在备份标签存在时尝试恢复
+            if git rev-parse -q --verify "refs/tags/$BACKUP_TAG" >/dev/null 2>&1; then
+              echo "Attempting to restore backup tag..."
+              git tag -f latest "$BACKUP_TAG" 2>/dev/null || true
+            fi
+            exit 1
+          fi
           
           echo "Release created successfully"
         env:
@@ -233,39 +462,45 @@ jobs:
           esac
           
           echo "Notification: $MESSAGE"
-          echo "message=$MESSAGE" >> "$GITHUB_OUTPUT"
 
       - name: Log execution info
         if: always()
         run: |
           set -euo pipefail
-          RAW_LATEST_VERSION="${{ steps.version.outputs.version }}"
-          RAW_CURRENT_VERSION="${{ steps.current.outputs.current }}"
-          RAW_NEEDS_UPDATE="${{ steps.compare.outputs.needs_update }}"
-          RAW_DOWNLOADED_FILE="${{ steps.download.outputs.filename }}"
           
-          LATEST_VERSION="${RAW_LATEST_VERSION:-N/A}"
-          CURRENT_VERSION="${RAW_CURRENT_VERSION:-N/A}"
-          NEEDS_UPDATE_STATUS="${RAW_NEEDS_UPDATE:-N/A}"
-          DOWNLOADED_FILE="${RAW_DOWNLOADED_FILE:-N/A}"
+          # 安全地获取变量值，提供清晰的默认值（使用shell参数扩展语法）
+          LATEST_VERSION="${{ steps.version.outputs.version }}"
+          CURRENT_VERSION="${{ steps.current.outputs.current }}"
+          NEEDS_UPDATE_STATUS="${{ steps.compare.outputs.needs_update }}"
+          DOWNLOADED_FILE="${{ steps.download.outputs.filename }}"
           
-          echo "=== Workflow Execution Summary ==="
-          echo "Repository: ${{ github.repository }}"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Run Number: ${{ github.run_number }}"
-          echo "Actor: ${{ github.actor }}"
-          echo "Event: ${{ github.event_name }}"
-          echo "Branch: ${{ github.ref }}"
-          echo "Commit: ${{ github.sha }}"
-          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "Latest Version: $LATEST_VERSION"
-          echo "Current Version: $CURRENT_VERSION"
-          echo "Needs Update: $NEEDS_UPDATE_STATUS"
-          echo "Downloaded File: $DOWNLOADED_FILE"
+          # 获取job状态
+          JOB_STATUS="${{ job.status }}"
+          
+          echo "=================================="
+          echo "Workflow Execution Summary"
+          echo "=================================="
+          echo "Repository     : ${{ github.repository }}"
+          echo "Run ID         : ${{ github.run_id }}"
+          echo "Run Number     : ${{ github.run_number }}"
+          echo "Actor          : ${{ github.actor }}"
+          echo "Event          : ${{ github.event_name }}"
+          echo "Branch         : ${{ github.ref }}"
+          echo "Commit         : ${{ github.sha }}"
+          echo "Job Status     : $JOB_STATUS"
+          echo "Timestamp      : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "----------------------------------"
+          echo "Latest Version : ${LATEST_VERSION:-N/A}"
+          echo "Current Version: ${CURRENT_VERSION:-N/A}"
+          echo "Needs Update   : ${NEEDS_UPDATE_STATUS:-N/A}"
+          echo "Downloaded File: ${DOWNLOADED_FILE:-N/A}"
+          echo "Architecture   : ${{ env.ARCH }}"
           echo "=================================="
 
       - name: Cleanup
         if: always()
         run: |
-          rm -f AdGuardHome_*.tar.gz
-          echo "Cleanup completed"
+          set -euo pipefail
+          DELETED_FILES=$(find . -maxdepth 1 -name "AdGuardHome_*.tar.gz" -o -name "AdGuardHome_*.sha256" | wc -l)
+          rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
+          echo "Cleanup completed: removed $DELETED_FILES files"
