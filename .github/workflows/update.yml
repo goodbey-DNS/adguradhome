@@ -99,8 +99,8 @@ jobs:
             
             if [[ "$HTTP_CODE" != "200" ]]; then
               echo "Error: API returned HTTP $HTTP_CODE" >&2
-echo "=== Debug: Full response headers ===" >&2
-n              echo "$HTTP_RESPONSE" >&2
+              echo "=== Debug: Full response headers ===" >&2
+              echo "$HTTP_RESPONSE" >&2
               return 1
             fi
             
@@ -378,7 +378,7 @@ n              echo "$HTTP_RESPONSE" >&2
           echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
 
       - name: Verify download integrity
-        if: steps.download.outputs.filename
+        if: steps.download.outcome == 'success'
         run: |
           set -euo pipefail
           FILENAME="${{ steps.download.outputs.filename }}"
@@ -447,7 +447,7 @@ n              echo "$HTTP_RESPONSE" >&2
           echo "Integrity verification passed"
 
       - name: Delete old release
-        if: steps.download.outputs.filename
+        if: steps.download.outcome == 'success'
         run: |
           set -euo pipefail
           
@@ -483,7 +483,7 @@ n              echo "$HTTP_RESPONSE" >&2
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create new release
-        if: steps.download.outputs.filename
+        if: steps.download.outcome == 'success'
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
@@ -627,6 +627,6 @@ n              echo "$HTTP_RESPONSE" >&2
         if: always()
         run: |
           set -euo pipefail
-          DELETED_FILES=$(find . -maxdepth 1 -name "AdGuardHome_*.tar.gz" -o -name "AdGuardHome_*.sha256" | wc -l)
+          DELETED_FILES=$(find . -maxdepth 1 \( -name "AdGuardHome_*.tar.gz" -o -name "AdGuardHome_*.sha256" \) | wc -l)
           rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
           echo "Cleanup completed: removed $DELETED_FILES files"
