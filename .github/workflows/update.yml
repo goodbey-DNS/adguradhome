@@ -42,21 +42,26 @@ jobs:
         run: |
           set -euo pipefail
           
+          # Export environment variables
+          export REPO="${{ env.REPO }}"
+          export TIMEOUT="${{ env.TIMEOUT }}"
+          export RETRIES="${{ env.RETRIES }}"
+          export RETRY_DELAY_BASE="${{ env.RETRY_DELAY_BASE }}"
+          
           get_latest() {
-            local response
             local http_code
             
-            response=$(curl -s -w "\n%{http_code}" --max-time "$TIMEOUT" \
+            # Use separate files for response and http code to avoid parsing issues
+            http_code=$(curl -s -w "%{http_code}" --max-time "$TIMEOUT" \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -o /tmp/latest_response.json \
               "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
-            
-            http_code=$(echo "$response" | tail -n1)
             
             if [[ "$http_code" != "200" ]]; then
               return 1
             fi
             
-            echo "$response" | head -n-1 | jq -r '.tag_name // empty'
+            jq -r '.tag_name // empty' /tmp/latest_response.json 2>/dev/null
           }
           
           VERSION=""
@@ -78,7 +83,12 @@ jobs:
               fi
             fi
             
-            [[ $i -lt $RETRIES ]] && sleep $((RETRY_DELAY_BASE ** i))
+            # Calculate backoff with cap at 60 seconds to avoid job timeout
+            if [[ $i -lt $RETRIES ]]; then
+              local backoff=$((RETRY_DELAY_BASE ** i))
+              [[ $backoff -gt 60 ]] && backoff=60
+              sleep $backoff
+            fi
           done
           
           [[ -n "$VERSION" ]] || { echo "Error: Failed to get valid version after $RETRIES attempts"; exit 1; }
@@ -90,6 +100,9 @@ jobs:
         id: current
         run: |
           set -euo pipefail
+          
+          # Export environment variables
+          export TIMEOUT="${{ env.TIMEOUT }}"
           
           RESPONSE=$(curl -s -w "\n%{http_code}" --max-time "$TIMEOUT" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
@@ -143,6 +156,14 @@ jobs:
         run: |
           set -euo pipefail
           
+          # Export environment variables
+          export REPO="${{ env.REPO }}"
+          export ARCH="${{ env.ARCH }}"
+          export RETRIES="${{ env.RETRIES }}"
+          export RETRY_DELAY_BASE="${{ env.RETRY_DELAY_BASE }}"
+          export CURL_MAX_TIME="${{ env.CURL_MAX_TIME }}"
+          export TIMEOUT="${{ env.TIMEOUT }}"
+          
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="AdGuardHome_${ARCH}.tar.gz"
           SHA256SUMS="AdGuardHome_${ARCH}.tar.gz.sha256"
@@ -159,11 +180,25 @@ jobs:
             # Download files sequentially (more reliable)
             if ! curl -L --max-time "$CURL_MAX_TIME" -o "$FILENAME" "${BASE_URL}/${FILENAME}"; then
               echo "Failed to download $FILENAME"
+              [[ $i -lt $RETRIES ]] || break
+              
+              # Calculate backoff with cap at 60 seconds
+              local backoff=$((RETRY_DELAY_BASE ** i))
+              [[ $backoff -gt 60 ]] && backoff=60
+              echo "Waiting ${backoff}s before retry..."
+              sleep $backoff
               continue
             fi
             
             if ! curl -L --max-time "$TIMEOUT" -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}"; then
               echo "Failed to download $SHA256SUMS"
+              [[ $i -lt $RETRIES ]] || break
+              
+              # Calculate backoff with cap at 60 seconds
+              local backoff=$((RETRY_DELAY_BASE ** i))
+              [[ $backoff -gt 60 ]] && backoff=60
+              echo "Waiting ${backoff}s before retry..."
+              sleep $backoff
               continue
             fi
             
@@ -173,6 +208,14 @@ jobs:
             fi
             
             echo "Downloaded files are empty or missing"
+            
+            [[ $i -lt $RETRIES ]] || break
+            
+            # Calculate backoff with cap at 60 seconds
+            local backoff=$((RETRY_DELAY_BASE ** i))
+            [[ $backoff -gt 60 ]] && backoff=60
+            echo "Waiting ${backoff}s before retry..."
+            sleep $backoff
           done
           
           # Final verification
@@ -188,17 +231,28 @@ jobs:
         run: |
           set -euo pipefail
           
+          # Export environment variables
+          export MIN_FILE_SIZE="${{ env.MIN_FILE_SIZE }}"
+          export MAX_FILE_SIZE="${{ env.MAX_FILE_SIZE }}"
+          
           FILENAME="${{ steps.download.outputs.filename }}"
           SHA256FILE="${{ steps.download.outputs.sha256file }}"
           
           [[ -f "$SHA256FILE" && -f "$FILENAME" ]] || { echo "Error: Required files not found"; exit 1; }
           
-          # Extract SHA256 from file (first 64-char hex string)
+          # Extract SHA256 from file (first 64-char hex string, support both "hash" and "hash filename" formats)
           EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
           
           if [[ -z "$EXPECTED" ]]; then
-            # Try alternative: extract from any position
+            # Try alternative: extract from any position (handles "hash filename" format)
             EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
+          fi
+          
+          if [[ -z "$EXPECTED" ]]; then
+            # Last resort: read first line and extract hex string
+            local first_line
+            first_line=$(head -n1 "$SHA256FILE" 2>/dev/null || echo "")
+            EXPECTED=$(echo "$first_line" | grep -oE '[a-fA-F0-9]{64}' | head -n1)
           fi
           
           [[ -n "$EXPECTED" ]] || { echo "Error: Cannot extract SHA256 hash from $SHA256FILE"; exit 1; }
@@ -243,6 +297,10 @@ jobs:
         if: steps.download.outputs.filename
         run: |
           set -euo pipefail
+          
+          # Export environment variables
+          export REPO="${{ env.REPO }}"
+          export ARCH="${{ env.ARCH }}"
           
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="${{ steps.download.outputs.filename }}"
