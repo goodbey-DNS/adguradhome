@@ -1,7 +1,7 @@
 name: AdGuardHome Auto Update
 on:
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '0 22 * * *'
   workflow_dispatch:
 
 permissions:
@@ -24,104 +24,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache API responses
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/api-responses
+          key: api-cache-adguard-${{ github.run_id }}
+          restore-keys: |
+            api-cache-adguard-
+
       - name: Setup tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl
+          echo "jq version: $(jq --version)"
+          echo "curl version: $(curl --version | head -n1)"
 
       - name: Get latest version
         id: version
         run: |
-          get_latest_tag() {
+          set -euo pipefail
+          get_version() {
             curl -s --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$1/releases/latest" 2>&1 | \
-              jq -r '.tag_name // empty' 2>/dev/null
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" \
+              2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//'
           }
           
+          VERSION=""
           for i in $(seq 1 ${{ env.RETRIES }}); do
-            TAG_NAME=$(get_latest_tag "${{ env.REPO }}")
-            if [[ -n "$TAG_NAME" ]]; then
-              VERSION=$(echo "$TAG_NAME" | sed 's/^v//')
+            VERSION=$(get_version)
+            if [[ -n "$VERSION" ]]; then
               echo "Latest version: $VERSION"
               echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-              exit 0
+              break
             fi
-            [[ $i -lt ${{ env.RETRIES }} ]] && sleep $((2 ** i))
+            echo "Attempt $i failed, retrying..."
+            sleep $((2 ** i))
           done
           
-          echo "Error: Cannot get version after ${{ env.RETRIES }} attempts"
-          exit 1
+          if [[ -z "$VERSION" ]]; then
+            echo "Error: Cannot get version after ${{ env.RETRIES }} attempts"
+            exit 1
+          fi
 
       - name: Get current version
         id: current
         run: |
-          get_current_tag() {
-            RESPONSE=$(curl -s -w "\n%{http_code}" --max-time ${{ env.TIMEOUT }} \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>&1)
-            
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            BODY=$(echo "$RESPONSE" | sed '$d')
-            
-            [[ "$HTTP_CODE" == "404" ]] && echo "none" && return 0
-            
-            TAG_NAME=$(echo "$BODY" | jq -r '.tag_name // "none"' 2>/dev/null)
-            [[ "$TAG_NAME" == "null" ]] || [[ "$TAG_NAME" == "none" ]] && echo "none" && return 0
-            
-            VERSION=$(echo "$TAG_NAME" | sed 's/^v//')
-            [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] && echo "$VERSION" || echo "none"
-          }
-          
-          for i in $(seq 1 ${{ env.RETRIES }}); do
-            CURRENT=$(get_current_tag)
-            if [[ -n "$CURRENT" ]]; then
-              echo "Current version: $CURRENT"
-              echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            [[ $i -lt ${{ env.RETRIES }} ]] && sleep $((2 ** i))
-          done
-          
-          echo "current=none" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          CURRENT=$(curl -s --max-time ${{ env.TIMEOUT }} \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" \
+            2>/dev/null | jq -r '.name // "none"' | grep -oP 'v\K[0-9.]+' || echo "none")
+          echo "Current version: $CURRENT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Compare versions
         id: compare
         run: |
-          version_to_int() {
-            local version="${1#v}"
-            [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || return 1
-            
-            IFS='.' read -r -a parts <<< "$version"
-            printf "%06d%06d%06d%06d" \
-              "${parts[0]:-0}" "${parts[1]:-0}" "${parts[2]:-0}" "${parts[3]:-0}"
-          }
-          
+          set -euo pipefail
           LATEST="${{ steps.version.outputs.version }}"
           CURRENT="${{ steps.current.outputs.current }}"
           
-          if [[ "$CURRENT" == "none" ]]; then
+          echo "=== Version Comparison ==="
+          echo "Latest from official: $LATEST"
+          echo "Current in repo: $CURRENT"
+          echo "========================="
+          
+          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "Update: No current version"
+            echo "Update needed: $CURRENT → $LATEST"
           else
-            LATEST_INT=$(version_to_int "$LATEST")
-            CURRENT_INT=$(version_to_int "$CURRENT")
-            
-            if [[ "$LATEST_INT" -gt "$CURRENT_INT" ]]; then
-              echo "needs_update=true" >> "$GITHUB_OUTPUT"
-              echo "Update: $CURRENT -> $LATEST"
-            else
-              echo "needs_update=false" >> "$GITHUB_OUTPUT"
-              echo "Latest: v$LATEST"
-            fi
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already latest: v$LATEST"
           fi
 
       - name: Download AdGuardHome
         if: steps.compare.outputs.needs_update == 'true'
         id: download
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="AdGuardHome_${{ env.ARCH }}.tar.gz"
           SHA256SUMS="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
@@ -142,8 +124,9 @@ jobs:
           echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
 
       - name: Verify download integrity
-        if: steps.download.outcome == 'success'
+        if: steps.download.outputs.filename
         run: |
+          set -euo pipefail
           FILENAME="${{ steps.download.outputs.filename }}"
           SHA256FILE="${{ steps.download.outputs.sha256file }}"
           
@@ -162,29 +145,28 @@ jobs:
           echo "Verification passed"
 
       - name: Delete old release
-        if: steps.download.outcome == 'success'
-        continue-on-error: true
+        if: steps.download.outputs.filename
         run: |
-          CURRENT_VERSION="${{ steps.current.outputs.current }}"
-          if [[ "$CURRENT_VERSION" != "none" ]]; then
-            if gh release view "v${CURRENT_VERSION}" >/dev/null 2>&1; then
-              gh release delete "v${CURRENT_VERSION}" --yes --cleanup-tag
-            fi
+          set -euo pipefail
+          if gh release view v-latest >/dev/null 2>&1; then
+            echo "Deleting existing v-latest release..."
+            gh release delete v-latest --yes --cleanup-tag
+          else
+            echo "No existing v-latest release found"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create new release
-        if: steps.download.outcome == 'success'
+        if: steps.download.outputs.filename
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="${{ steps.download.outputs.filename }}"
           
           [[ -n "$VERSION" && -f "$FILENAME" ]] || { echo "Error: Missing required data"; exit 1; }
           
-          SHA256=$(sha256sum "$FILENAME" | cut -d' ' -f1)
-          NOTES_FILE=$(mktemp)
-          cat > "$NOTES_FILE" <<EOF
+          NOTES=$(cat <<EOF
           ## AdGuardHome v${VERSION}
           
           **Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
@@ -199,16 +181,20 @@ jobs:
           sudo ./AdGuardHome -s install
           \`\`\`
           
-          ### Verification
-          SHA256: ${SHA256}
+          ### Download URL
+          **Fixed download link (always points to latest version):**
+          \`\`\`
+          https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}
+          \`\`\`
           EOF
+          )
           
-          gh release create "v${VERSION}" \
+          gh release create v-latest \
             --title "AdGuardHome v${VERSION}" \
-            --notes-file "$NOTES_FILE" \
+            --notes "$NOTES" \
             "$FILENAME"
           
-          rm -f "$NOTES_FILE"
+          echo "Release created successfully"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -225,7 +211,12 @@ jobs:
           echo "Job Status     : ${{ job.status }}"
           echo "Timestamp      : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=================================="
+          echo "Fixed Download URL (never changes):"
+          echo "https://github.com/${{ github.repository }}/releases/download/v-latest/AdGuardHome_${{ env.ARCH }}.tar.gz"
+          echo "=================================="
 
       - name: Cleanup
         if: always()
-        run: rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
+        run: |
+          rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
+          echo "Cleanup completed"
