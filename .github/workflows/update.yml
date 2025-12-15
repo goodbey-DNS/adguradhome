@@ -6,15 +6,6 @@ on:
   schedule:
     - cron: '0 22 * * *'  # 6 AM Beijing Time (UTC+8)
   workflow_dispatch:
-    inputs:
-      force_update:
-        description: 'Force update even if version is current'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
 
 permissions:
   contents: write
@@ -52,21 +43,46 @@ jobs:
           set -euo pipefail
           
           get_latest() {
-            curl -s --max-time "$TIMEOUT" \
+            local response
+            local http_code
+            
+            response=$(curl -s -w "\n%{http_code}" --max-time "$TIMEOUT" \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/$REPO/releases/latest" \
-              2>/dev/null | jq -r '.tag_name // empty'
+              "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+            
+            http_code=$(echo "$response" | tail -n1)
+            
+            if [[ "$http_code" != "200" ]]; then
+              return 1
+            fi
+            
+            echo "$response" | head -n-1 | jq -r '.tag_name // empty'
           }
           
           VERSION=""
           for i in $(seq 1 "$RETRIES"); do
-            VERSION=$(get_latest | sed 's/^v//')
-            [[ -n "$VERSION" ]] && break
-            echo "Attempt $i failed, retrying..."
-            sleep $((RETRY_DELAY_BASE ** i))
+            echo "Fetching latest version (attempt $i/$RETRIES)..."
+            
+            local tag
+            tag=$(get_latest)
+            
+            if [[ $? -eq 0 && -n "$tag" ]]; then
+              VERSION=$(echo "$tag" | sed 's/^v//')
+              
+              # Validate version format (semantic versioning)
+              if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                break
+              else
+                echo "Warning: Invalid version format: $VERSION"
+                VERSION=""
+              fi
+            fi
+            
+            [[ $i -lt $RETRIES ]] && sleep $((RETRY_DELAY_BASE ** i))
           done
           
-          [[ -n "$VERSION" ]] || { echo "Error: Cannot get version"; exit 1; }
+          [[ -n "$VERSION" ]] || { echo "Error: Failed to get valid version after $RETRIES attempts"; exit 1; }
+          
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "✓ Latest version: $VERSION"
 
@@ -75,15 +91,32 @@ jobs:
         run: |
           set -euo pipefail
           
-          RESPONSE=$(curl -s --max-time "$TIMEOUT" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" --max-time "$TIMEOUT" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" \
             2>/dev/null || echo "")
           
-          if [[ -z "$RESPONSE" ]] || [[ "$(echo "$RESPONSE" | jq -r '.message // empty')" == "Not Found" ]]; then
+          if [[ -z "$RESPONSE" ]]; then
             CURRENT="none"
           else
-            CURRENT=$(echo "$RESPONSE" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/' || echo "none")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            
+            if [[ "$HTTP_CODE" == "404" ]]; then
+              CURRENT="none"
+            elif [[ "$HTTP_CODE" == "200" ]]; then
+              local name
+              name=$(echo "$RESPONSE" | head -n-1 | jq -r '.name // "none"')
+              
+              # Extract version from name (e.g., "v1.2.3" -> "1.2.3")
+              if [[ "$name" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                CURRENT="${BASH_REMATCH[1]}"
+              else
+                CURRENT="none"
+              fi
+            else
+              echo "Warning: Unexpected HTTP $HTTP_CODE"
+              CURRENT="none"
+            fi
           fi
           
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
@@ -96,9 +129,8 @@ jobs:
           
           LATEST="${{ steps.version.outputs.version }}"
           CURRENT="${{ steps.current.outputs.current }}"
-          FORCE="${{ github.event.inputs.force_update || 'false' }}"
           
-          if [[ "$FORCE" == "true" ]] || [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
+          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
             echo "update=true" >> "$GITHUB_OUTPUT"
             echo "✓ Update needed: $CURRENT → $LATEST"
           else
@@ -119,25 +151,32 @@ jobs:
           echo "Downloading v${VERSION}..."
           
           for i in $(seq 1 "$RETRIES"); do
-            curl -L --max-time "$CURL_MAX_TIME" -o "$FILENAME" "${BASE_URL}/${FILENAME}" &
-            PID1=$!
-            curl -L --max-time "$TIMEOUT" -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}" &
-            PID2=$!
+            echo "Download attempt $i/$RETRIES..."
             
-            wait $PID1
-            EXIT1=$?
-            wait $PID2
-            EXIT2=$?
+            # Clean up any partial downloads
+            rm -f "$FILENAME" "$SHA256SUMS"
             
-            if [[ $EXIT1 -eq 0 && $EXIT2 -eq 0 && -f "$FILENAME" && -f "$SHA256SUMS" ]]; then
+            # Download files sequentially (more reliable)
+            if ! curl -L --max-time "$CURL_MAX_TIME" -o "$FILENAME" "${BASE_URL}/${FILENAME}"; then
+              echo "Failed to download $FILENAME"
+              continue
+            fi
+            
+            if ! curl -L --max-time "$TIMEOUT" -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}"; then
+              echo "Failed to download $SHA256SUMS"
+              continue
+            fi
+            
+            # Verify files exist and have content
+            if [[ -s "$FILENAME" && -s "$SHA256SUMS" ]]; then
               break
             fi
             
-            rm -f "$FILENAME" "$SHA256SUMS"
-            [[ $i -eq $RETRIES ]] && { echo "Download failed"; exit 1; }
-            
-            sleep $((RETRY_DELAY_BASE ** i))
+            echo "Downloaded files are empty or missing"
           done
+          
+          # Final verification
+          [[ -s "$FILENAME" && -s "$SHA256SUMS" ]] || { echo "Error: Download failed after $RETRIES attempts"; exit 1; }
           
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
           echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
@@ -152,18 +191,33 @@ jobs:
           FILENAME="${{ steps.download.outputs.filename }}"
           SHA256FILE="${{ steps.download.outputs.sha256file }}"
           
-          [[ -f "$SHA256FILE" && -f "$FILENAME" ]] || { echo "Files missing"; exit 1; }
+          [[ -f "$SHA256FILE" && -f "$FILENAME" ]] || { echo "Error: Required files not found"; exit 1; }
           
-          EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
-          [[ -n "$EXPECTED" ]] || { echo "Cannot extract SHA256"; exit 1; }
+          # Extract SHA256 from file (first 64-char hex string)
+          EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
           
+          if [[ -z "$EXPECTED" ]]; then
+            # Try alternative: extract from any position
+            EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
+          fi
+          
+          [[ -n "$EXPECTED" ]] || { echo "Error: Cannot extract SHA256 hash from $SHA256FILE"; exit 1; }
+          
+          # Validate SHA256 format
+          [[ "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "Error: Invalid SHA256 format: $EXPECTED"; exit 1; }
+          
+          # Compute actual SHA256
           ACTUAL=$(sha256sum "$FILENAME" | awk '{print $1}')
-          [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "SHA256 mismatch"; exit 1; }
+          [[ -n "$ACTUAL" ]] || { echo "Error: Cannot compute SHA256"; exit 1; }
           
-          tar -tzf "$FILENAME" >/dev/null 2>&1 || { echo "Invalid archive"; exit 1; }
+          [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "Error: SHA256 mismatch"; echo "Expected: $EXPECTED"; echo "Actual:   $ACTUAL"; exit 1; }
           
+          # Verify archive integrity
+          tar -tzf "$FILENAME" >/dev/null 2>&1 || { echo "Error: Invalid or corrupted archive"; exit 1; }
+          
+          # Check file size
           SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
-          [[ $SIZE -ge $MIN_FILE_SIZE && $SIZE -le $MAX_FILE_SIZE ]] || { echo "File size invalid"; exit 1; }
+          [[ $SIZE -ge $MIN_FILE_SIZE && $SIZE -le $MAX_FILE_SIZE ]] || { echo "Error: File size $SIZE bytes outside allowed range"; exit 1; }
           
           echo "✓ Verification passed"
 
@@ -173,10 +227,15 @@ jobs:
           set -euo pipefail
           
           if gh release view v-latest >/dev/null 2>&1; then
-            gh release delete v-latest --yes --cleanup-tag || echo "Warning: Delete failed"
+            echo "Deleting existing v-latest release..."
+            if gh release delete v-latest --yes --cleanup-tag 2>/dev/null; then
+              echo "✓ Old release deleted"
+            else
+              echo "Warning: Failed to delete old release (may not exist or already deleted)"
+            fi
+          else
+            echo "✓ No existing v-latest release to delete"
           fi
-          
-          echo "✓ Old release cleaned"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -188,7 +247,11 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="${{ steps.download.outputs.filename }}"
           
-          gh release create v-latest \
+          [[ -n "$VERSION" && -f "$FILENAME" ]] || { echo "Error: Missing required data for release"; exit 1; }
+          
+          echo "Creating release v-latest for AdGuardHome v${VERSION}..."
+          
+          if gh release create v-latest \
             --title "AdGuardHome v${VERSION}" \
             --notes "## AdGuardHome v${VERSION}
           
@@ -200,9 +263,12 @@ jobs:
           
           ### Download URL
           https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}" \
-            "$FILENAME"
-          
-          echo "✓ Release created"
+            "$FILENAME"; then
+            echo "✓ Release created successfully"
+          else
+            echo "Error: Failed to create release"
+            exit 1
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
