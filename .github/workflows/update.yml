@@ -128,12 +128,12 @@ jobs:
             fi
             
             # 提取并验证SHA256
-            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || true)
+            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
             if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || true)
+              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
             fi
             if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}' || true)
+              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}') || true
             fi
             if [[ -z "$EXPECTED" ]]; then
               echo "Cannot extract SHA256"
