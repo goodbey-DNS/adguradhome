@@ -91,7 +91,7 @@ jobs:
             echo "✓ Already latest: v${{ steps.official.outputs.version }}"
           fi
 
-      # 4. 下载并验证（损坏即重试）
+      # 4. 下载并验证（损坏即重试）— FIX: 修复 continue 语法错误
       - name: Download
         if: steps.decide.outputs.should_update == 'true'
         id: download
@@ -107,33 +107,33 @@ jobs:
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
             
-            # 下载文件
-            if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
+            # FIX1: 改用 || { ...; continue; } 链式语法，避免 if 块内 continue 语法错误
+            curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE" || {
               echo "Failed: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
-            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA"; then
+            curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" || {
               echo "Failed: $SHA"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
             # 验证文件
-            if [[ ! -s "$FILE" || ! -s "$SHA" ]]; then
+            [[ -s "$FILE" && -s "$SHA" ]] || {
               echo "Empty files"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
-            # 提取并验证SHA256
-            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
+            # FIX2: 所有 grep 末尾加 || true，防止空文件触发 set -e
+            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || true) || true
             if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
+              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || true) || true
             fi
             if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}') || true
+              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}' || true) || true
             fi
             if [[ -z "$EXPECTED" ]]; then
               echo "Cannot extract SHA256"
@@ -142,31 +142,31 @@ jobs:
             fi
             
             ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-            if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            [[ "$EXPECTED" == "$ACTUAL" ]] || {
               echo "SHA256 mismatch"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
             # 验证archive
-            if ! tar -tzf "$FILE" >/dev/null 2>&1; then
+            tar -tzf "$FILE" >/dev/null 2>&1 || {
               echo "Invalid archive"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
             # 验证大小
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            if [[ $SIZE -le $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]]; then
+            [[ $SIZE -gt $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]] || {
               echo "File too small"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
-            if [[ $SIZE -ge $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]]; then
+            }
+            [[ $SIZE -lt $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]] || {
               echo "File too large"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            fi
+            }
             
             # 全部通过
             break
