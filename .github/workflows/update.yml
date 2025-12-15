@@ -1,16 +1,6 @@
 name: AdGuardHome Auto Update
-# Description: Automatically checks for AdGuardHome updates daily at 6 AM Beijing time (UTC 22:00)
-# and maintains a fixed download URL that always points to the latest version.
-# 
-# Features:
-# - Daily automated version checks
-# - Fixed download URL (never changes)
-# - SHA256 integrity verification
-# - Comprehensive error handling and logging
-# - Retry mechanism with exponential backoff
-# - Security scanning for downloaded files
-# - Notification support (configurable)
-# - Performance monitoring and metrics
+# Description: Production-ready workflow for automated AdGuardHome updates with robust error handling,
+# intelligent caching, and zero-maintenance operation.
 
 on:
   schedule:
@@ -22,14 +12,11 @@ on:
         required: false
         default: 'false'
         type: choice
-        options:
-          - 'true'
-          - 'false'
+        options: ['true', 'false']
 
 permissions:
   contents: write
-  issues: write  # For creating issues on failure
-  actions: read   # For workflow metrics
+  issues: write
 
 env:
   # Repository settings
@@ -37,26 +24,19 @@ env:
   ARCH: linux_amd64
   
   # Network settings
-  TIMEOUT: 30
-  RETRIES: 3
-  RETRY_DELAY_BASE: 5  # Fixed: 5s base for proper exponential backoff (5, 25, 125s)
-  RETRY_DELAY_MAX: 300  # Cap at 5 minutes
+  API_TIMEOUT: 30
+  CURL_TIMEOUT: 300
+  MAX_RETRIES: 3
+  RETRY_BASE_SEC: 5
+  RETRY_MAX_SEC: 300
   
   # Security settings
-  MIN_FILE_SIZE: 10000000  # 10MB minimum
-  MAX_FILE_SIZE: 50000000  # 50MB maximum
-  
-  # Performance settings
-  CURL_MAX_TIME: 300  # 5 minutes for download
+  MIN_SIZE_BYTES: 10000000
+  MAX_SIZE_BYTES: 50000000
   
   # Cache settings
-  CACHE_VERSION: v2  # Increment when cache structure changes
-  CACHE_DURATION: 3600  # 1 hour cache validity
-  
-  # Notification settings (optional)
-  # ENABLE_NOTIFICATIONS: 'false'  # Set to 'true' to enable
-  # NOTIFY_ON_SUCCESS: 'true'
-  # NOTIFY_ON_FAILURE: 'true'
+  CACHE_VERSION: v1
+  CACHE_HOURS: 6
 
 jobs:
   update:
@@ -65,646 +45,302 @@ jobs:
     concurrency:
       group: adguard-update
       cancel-in-progress: false
+    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Cache API responses
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/api-responses
-          key: api-cache-${{ env.CACHE_VERSION }}-${{ env.REPO }}-${{ hashFiles('**/update.yml') }}
-          restore-keys: |
-            api-cache-${{ env.CACHE_VERSION }}-${{ env.REPO }}-
-
-      - name: Setup tools and environment
+      - name: Setup environment
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl
-          echo "jq version: $(jq --version)"
-          echo "curl version: $(curl --version | head -n1)"
+          # Export all env variables to GITHUB_ENV for persistent availability
+          {
+            echo "REPO=${{ env.REPO }}"
+            echo "ARCH=${{ env.ARCH }}"
+            echo "API_TIMEOUT=${{ env.API_TIMEOUT }}"
+            echo "CURL_TIMEOUT=${{ env.CURL_TIMEOUT }}"
+            echo "MAX_RETRIES=${{ env.MAX_RETRIES }}"
+            echo "RETRY_BASE_SEC=${{ env.RETRY_BASE_SEC }}"
+            echo "RETRY_MAX_SEC=${{ env.RETRY_MAX_SEC }}"
+            echo "MIN_SIZE_BYTES=${{ env.MIN_SIZE_BYTES }}"
+            echo "MAX_SIZE_BYTES=${{ env.MAX_SIZE_BYTES }}"
+            echo "CACHE_VERSION=${{ env.CACHE_VERSION }}"
+            echo "CACHE_HOURS=${{ env.CACHE_HOURS }}"
+          } >> "$GITHUB_ENV"
           
-          # Create environment setup script for all subsequent steps
-          cat > ~/.workflow_env << 'EOF'
+          # Setup utility functions for all steps
+          cat > "$RUNNER_TEMP/workflow_functions.sh" << 'EOF'
           #!/bin/bash
-          # Global environment setup - sourced by all subsequent steps
           set -euo pipefail
           
-          # Export all workflow environment variables
-          export REPO="${{ env.REPO }}"
-          export ARCH="${{ env.ARCH }}"
-          export TIMEOUT="${{ env.TIMEOUT }}"
-          export RETRIES="${{ env.RETRIES }}"
-          export RETRY_DELAY_BASE="${{ env.RETRY_DELAY_BASE }}"
-          export RETRY_DELAY_MAX="${{ env.RETRY_DELAY_MAX }}"
-          export MIN_FILE_SIZE="${{ env.MIN_FILE_SIZE }}"
-          export MAX_FILE_SIZE="${{ env.MAX_FILE_SIZE }}"
-          export CURL_MAX_TIME="${{ env.CURL_MAX_TIME }}"
-          export CACHE_VERSION="${{ env.CACHE_VERSION }}"
-          export CACHE_DURATION="${{ env.CACHE_DURATION }}"
-          
-          # Common utility functions
-          retry_with_backoff() {
-            local retry_function="$1"
-            local max_retries="${2:-$RETRIES}"
-            local base_delay="${3:-$RETRY_DELAY_BASE}"
-            local max_delay="${4:-$RETRY_DELAY_MAX}"
+          # Retry with exponential backoff and jitter
+          retry() {
+            local cmd=("$@")
+            local attempt=0
+            local delay=0
             
-            for i in $(seq 1 "$max_retries"); do
-              if "$retry_function"; then
+            while (( attempt < MAX_RETRIES )); do
+              if "${cmd[@]}"; then
                 return 0
               fi
               
-              if [[ $i -eq $max_retries ]]; then
+              (( attempt++ ))
+              if (( attempt >= MAX_RETRIES )); then
                 return 1
               fi
               
-              # Calculate exponential backoff with cap
-              local delay=$(( base_delay ** i ))
-              if [[ $delay -gt $max_delay ]]; then
-                delay=$max_delay
-              fi
+              delay=$(( RETRY_BASE_SEC ** attempt + RANDOM % 10 ))
+              (( delay > RETRY_MAX_SEC )) && delay=$RETRY_MAX_SEC
               
-              echo "⏳ Waiting ${delay}s before retry (attempt $i/$max_retries)..."
+              echo "⏳ Retry $attempt/$MAX_RETRIES in ${delay}s..."
               sleep "$delay"
             done
           }
           
-          sanitize_cache_key() {
-            local key="$1"
-            # Replace unsafe characters with underscores
-            echo "$key" | sed 's/[^a-zA-Z0-9._-]/_/g'
+          # Safe API call with rate limit detection
+          api_call() {
+            local url=$1
+            local output=$2
+            local rate_limit
+            
+            if curl -s --fail-with-body --max-time "$API_TIMEOUT" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -w "%{http_code}" -o "$output" "$url" > "$RUNNER_TEMP/http_code"; then
+              
+              rate_limit=$(grep -i '^x-ratelimit-remaining:' "$output" | tr -d '\r' | awk '{print $2}')
+              if [[ -n "$rate_limit" && "$rate_limit" -lt 10 ]]; then
+                echo "⚠️  Warning: GitHub API rate limit low: $rate_limit remaining"
+              fi
+              return 0
+            fi
+            
+            echo "❌ API call failed: HTTP $(<"$RUNNER_TEMP/http_code")"
+            return 1
           }
           
-          get_cached_response() {
-            local cache_key="$1"
-            local max_age="${2:-$CACHE_DURATION}"
-            local safe_key
-            safe_key=$(sanitize_cache_key "$cache_key")
-            local cache_file="$HOME/.cache/api-responses/${safe_key}.json"
+          # Cache-aware version fetch
+          get_version_cached() {
+            local cache_key=$1
+            local cache_file="$RUNNER_TEMP/$cache_key.json"
+            local cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
             
-            if [[ -f "$cache_file" ]]; then
-              local file_age
-              file_age=$(($(date +%s) - $(stat -c %Y "$cache_file")))
-              if [[ $file_age -lt $max_age ]]; then
-                cat "$cache_file"
-                return 0
-              fi
+            if [[ -f "$cache_file" && $cache_age -lt $(( CACHE_HOURS * 3600 )) ]]; then
+              echo "✓ Using cached response (${cache_age}s old)"
+              cat "$cache_file"
+              return 0
             fi
+            
             return 1
           }
           
           cache_response() {
-            local cache_key="$1"
-            local response="$2"
-            local safe_key
-            safe_key=$(sanitize_cache_key "$cache_key")
-            local cache_dir="$HOME/.cache/api-responses"
-            local cache_file="$cache_dir/${safe_key}.json"
+            local cache_key=$1
+            local response=$2
+            mkdir -p "$RUNNER_TEMP"
+            echo "$response" > "$RUNNER_TEMP/$cache_key.json"
+          }
+          
+          # Validate file integrity
+          verify_archive() {
+            local file=$1
+            local sha_file=$2
             
-            mkdir -p "$cache_dir"
-            echo "$response" > "$cache_file"
+            [[ -f "$sha_file" && -f "$file" ]] || return 1
+            
+            local expected_sha actual_sha
+            expected_sha=$(grep -oE '[a-f0-9]{64}' "$sha_file" | head -1 | tr '[:upper:]' '[:lower:]')
+            actual_sha=$(sha256sum "$file" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+            
+            [[ -n "$expected_sha" && "$expected_sha" == "$actual_sha" ]]
           }
           EOF
           
-          chmod +x ~/.workflow_env
-          echo "✓ Environment setup completed"
+          chmod +x "$RUNNER_TEMP/workflow_functions.sh"
+          echo "✓ Environment configured"
 
-      - name: Initialize workflow
-        id: init
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
-          # Source environment setup
-          source ~/.workflow_env
-          
-          START_TIME=$(date +%s)
-          echo "start_time=$START_TIME" >> "$GITHUB_OUTPUT"
-          echo "workflow_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-          echo "workflow_started_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
-          
-          # Create working directory
-          mkdir -p "${{ github.workspace }}/downloads"
-          cd "${{ github.workspace }}/downloads"
-          
-          echo "✓ Workflow initialization completed"
-          echo "  - Repository: ${{ github.repository }}"
-          echo "  - Runner: ${{ runner.os }}"
-          echo "  - Architecture: $ARCH"
-          echo "  - Force update: ${{ github.event.inputs.force_update || 'false' }}"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl
+          echo "jq: $(jq --version), curl: $(curl --version | head -1)"
 
       - name: Get latest version
         id: version
         run: |
-          set -euo pipefail
-          # Source environment setup
-          source ~/.workflow_env
+          source "$RUNNER_TEMP/workflow_functions.sh"
           
-          # Define variables
-          CACHE_KEY="latest_version_${REPO}"
-          VERSION=""
-          
-          # Try cache first
-          echo "🔍 Checking cache for latest version..."
-          CACHED_VERSION=$(get_cached_response "$CACHE_KEY" || echo "")
-          
-          if [[ -n "$CACHED_VERSION" ]]; then
-            VERSION=$(echo "$CACHED_VERSION" | jq -r '.tag_name // empty' | sed 's/^v//')
-            if [[ -n "$VERSION" ]]; then
-              echo "✓ Using cached latest version: $VERSION"
-              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          cache_key="latest_${REPO//\//_}"
+          if response=$(get_version_cached "$cache_key"); then
+            VERSION=$(echo "$response" | jq -r '.tag_name // empty' | sed 's/^v//')
+          else
+            response_file="$RUNNER_TEMP/latest.json"
+            retry api_call "https://api.github.com/repos/$REPO/releases/latest" "$response_file"
+            response=$(<"$response_file")
+            cache_response "$cache_key" "$response"
+            VERSION=$(echo "$response" | jq -r '.tag_name // empty' | sed 's/^v//')
           fi
           
-          # Fetch from API with retry
-          echo "📡 Fetching latest version from API..."
-          get_version() {
-            curl -s --max-time "$TIMEOUT" \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/releases/latest" \
-              2>/dev/null
-          }
-          
-          RESPONSE=""
-          if retry_with_backoff get_version; then
-            RESPONSE=$(get_version)
-            VERSION=$(echo "$RESPONSE" | jq -r '.tag_name // empty' | sed 's/^v//')
-            if [[ -n "$VERSION" ]]; then
-              echo "✓ Latest version: $VERSION"
-              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-              # Cache the response
-              cache_response "$CACHE_KEY" "$RESPONSE"
-              exit 0
-            fi
-          fi
-          
-          echo "❌ Error: Cannot get version after $RETRIES attempts"
-          exit 1
+          [[ -n "$VERSION" ]] || { echo "❌ Failed to get version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓ Latest: v$VERSION"
 
       - name: Get current version
         id: current
         run: |
-          set -euo pipefail
-          # Source environment setup
-          source ~/.workflow_env
+          source "$RUNNER_TEMP/workflow_functions.sh"
           
-          # Define variables
-          CACHE_KEY="current_version_${{ github.repository }}"
-          CURRENT="none"
-          
-          # Try cache first
-          echo "🔍 Checking cache for current version..."
-          CACHED_RESPONSE=$(get_cached_response "$CACHE_KEY" 300 || echo "")  # 5 min cache
-          
-          if [[ -n "$CACHED_RESPONSE" ]]; then
-            MSG=$(echo "$CACHED_RESPONSE" | jq -r '.message // empty')
-            if [[ "$MSG" != "Not Found" ]]; then
-              CURRENT=$(echo "$CACHED_RESPONSE" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/' || echo "none")
+          cache_key="current_${{ github.repository_owner }}_${{ github.event.repository.name }}"
+          if response=$(get_version_cached "$cache_key"); then
+            CURRENT=$(echo "$response" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/')
+          else
+            response_file="$RUNNER_TEMP/current.json"
+            api_call "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" "$response_file" || true
+            response=$(<"$response_file")
+            
+            if [[ "$(jq -r '.message // empty' <<< "$response")" == "Not Found" ]]; then
+              CURRENT="none"
+            else
+              CURRENT=$(echo "$response" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/')
             fi
-            echo "✓ Using cached current version: $CURRENT"
-            echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-            exit 0
+            cache_response "$cache_key" "$response"
           fi
           
-          # Fetch from API
-          echo "📡 Fetching current version from API..."
-          RESPONSE=$(curl -s --max-time "$TIMEOUT" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" \
-            2>/dev/null || echo "")
-          
-          if [[ -n "$RESPONSE" ]]; then
-            MSG=$(echo "$RESPONSE" | jq -r '.message // empty')
-            if [[ "$MSG" != "Not Found" ]]; then
-              CURRENT=$(echo "$RESPONSE" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/' || echo "none")
-            fi
-          fi
-          
-          echo "✓ Current version: $CURRENT"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          # Cache the response
-          cache_response "$CACHE_KEY" "$RESPONSE"
+          echo "current=${CURRENT:-none}" >> "$GITHUB_OUTPUT"
+          echo "✓ Current: ${CURRENT:-none}"
 
-      - name: Compare versions
-        id: compare
+      - name: Check update needed
+        id: check
         run: |
-          set -euo pipefail
-          
           LATEST="${{ steps.version.outputs.version }}"
           CURRENT="${{ steps.current.outputs.current }}"
-          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
           
-          echo "=== Version Comparison ==="
-          echo "Latest from official: $LATEST"
-          echo "Current in repo: $CURRENT"
-          echo "Force update: $FORCE_UPDATE"
-          echo "========================="
-          
-          if [[ "$FORCE_UPDATE" == "true" ]]; then
+          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]] || [[ "${{ github.event.inputs.force_update }}" == "true" ]]; then
             echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "✓ Force update enabled: will update to v$LATEST"
-          elif [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
-            echo "needs_update=true" >> "$GITHUB_OUTPUT"
-            echo "✓ Update needed: $CURRENT → $LATEST"
+            echo "✓ Update: $CURRENT → $LATEST"
           else
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
-            echo "✓ Already latest: v$LATEST"
+            echo "✓ No update needed"
           fi
 
       - name: Download AdGuardHome
-        if: steps.compare.outputs.needs_update == 'true'
+        if: steps.check.outputs.needs_update == 'true'
         id: download
         run: |
-          set -euo pipefail
-          # Source environment setup
-          source ~/.workflow_env
+          source "$RUNNER_TEMP/workflow_functions.sh"
           
           VERSION="${{ steps.version.outputs.version }}"
           FILENAME="AdGuardHome_${ARCH}.tar.gz"
-          SHA256SUMS="AdGuardHome_${ARCH}.tar.gz.sha256"
+          SHA_FILE="AdGuardHome_${ARCH}.tar.gz.sha256"
           BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
           
-          echo "⬇️  Starting download..."
-          echo "   Version: v${VERSION}"
-          echo "   Files: ${FILENAME}, ${SHA256SUMS}"
+          cd "$RUNNER_TEMP"
+          echo "⬇️ Downloading v$VERSION..."
           
-          DOWNLOAD_START=$(date +%s)
-          
-          # Download function with retry
-          download_files() {
-            # Clean up any previous partial downloads
-            rm -f "$FILENAME" "$SHA256SUMS"
+          download_task() {
+            curl -L --max-time "$CURL_TIMEOUT" --retry 3 -o "$FILENAME" "${BASE_URL}/${FILENAME}" &
+            CURL1=$!
+            curl -L --max-time "$API_TIMEOUT" --retry 3 -o "$SHA_FILE" "${BASE_URL}/${SHA_FILE}" &
+            CURL2=$!
             
-            echo "📥 Downloading files in parallel..."
-            # Use parallel downloads with background jobs
-            curl -L --max-time "$CURL_MAX_TIME" --retry 3 --retry-delay 5 \
-              -o "$FILENAME" "${BASE_URL}/${FILENAME}" &
-            CURL_PID1=$!
-            
-            curl -L --max-time "$TIMEOUT" --retry 3 --retry-delay 5 \
-              -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}" &
-            CURL_PID2=$!
-            
-            # Wait for both downloads to complete
-            wait $CURL_PID1
-            EXIT_CODE1=$?
-            wait $CURL_PID2
-            EXIT_CODE2=$?
-            
-            if [[ $EXIT_CODE1 -eq 0 ]] && [[ $EXIT_CODE2 -eq 0 ]] && \
-               [[ -f "$FILENAME" ]] && [[ -f "$SHA256SUMS" ]]; then
-              return 0
-            fi
-            
-            echo "⚠️  Download failed (exit codes: $EXIT_CODE1, $EXIT_CODE2)"
-            return 1
+            wait $CURL1 || return 1
+            wait $CURL2 || return 1
+            return 0
           }
           
-          # Retry with exponential backoff
-          if retry_with_backoff download_files; then
-            echo "✓ Both files downloaded successfully"
-          else
-            echo "❌ Error: Download failed after $RETRIES attempts"
-            exit 1
-          fi
+          retry download_task
           
-          DOWNLOAD_END=$(date +%s)
-          DOWNLOAD_DURATION=$((DOWNLOAD_END - DOWNLOAD_START))
+          # Verify integrity immediately
+          verify_archive "$FILENAME" "$SHA_FILE" || { echo "❌ Verification failed"; exit 1; }
           
-          # Get file sizes
-          FILE_SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
-          SHA_SIZE=$(stat -c%s "$SHA256SUMS" 2>/dev/null || echo 0)
+          # Validate size
+          SIZE=$(stat -c%s "$FILENAME")
+          (( SIZE >= MIN_SIZE_BYTES && SIZE <= MAX_SIZE_BYTES )) || { echo "❌ Size out of range: $SIZE bytes"; exit 1; }
           
-          echo ""
-          echo "✓ Download completed in ${DOWNLOAD_DURATION}s"
-          echo "  - Main file: $(( FILE_SIZE / 1024 / 1024 ))MB"
-          echo "  - Checksum:  $(( SHA_SIZE / 1024 ))KB"
+          # Ensure executable exists
+          tar -tzf "$FILENAME" | grep -qE '(^|/)AdGuardHome$' || { echo "❌ No executable found"; exit 1; }
           
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
-          echo "download_duration=$DOWNLOAD_DURATION" >> "$GITHUB_OUTPUT"
+          echo "sha_file=$SHA_FILE" >> "$GITHUB_OUTPUT"
+          echo "✓ Download verified"
 
-      - name: Verify download integrity
+      - name: Update release
         if: steps.download.outputs.filename
         run: |
-          set -euo pipefail
-          # Source environment setup
-          source ~/.workflow_env
+          source "$RUNNER_TEMP/workflow_functions.sh"
           
+          cd "$RUNNER_TEMP"
           FILENAME="${{ steps.download.outputs.filename }}"
-          SHA256FILE="${{ steps.download.outputs.sha256file }}"
-          
-          echo "🔍 Starting integrity verification..."
-          
-          # Check files exist
-          if [[ ! -f "$SHA256FILE" ]] || [[ ! -f "$FILENAME" ]]; then
-            echo "❌ Error: Required files not found"
-            echo "   SHA256 file: $([[ -f "$SHA256FILE" ]] && echo 'exists' || echo 'missing')"
-            echo "   Archive file: $([[ -f "$FILENAME" ]] && echo 'exists' || echo 'missing')"
-            ls -lh "$SHA256FILE" "$FILENAME" 2>&1 || true
-            exit 1
-          fi
-          echo "✓ Files exist: $FILENAME, $SHA256FILE"
-          
-          # Debug: Show file sizes
-          SHA_SIZE=$(wc -c < "$SHA256FILE")
-          FILE_SIZE=$(wc -c < "$FILENAME")
-          echo "📄 File sizes - SHA256: ${SHA_SIZE} bytes, Archive: ${FILE_SIZE} bytes"
-          
-          # Debug: Show SHA256 file content (first 200 chars)
-          echo "📝 SHA256 file content (first 200 chars):"
-          head -c 200 "$SHA256FILE" | sed 's/^/   /'
-          echo ""
-          
-          # Extract expected SHA256 - try multiple methods
-          echo "🔢 Extracting expected SHA256..."
-          
-          # Method 1: Get first 64-character hex string from file
-          EXPECTED_SHA=$(grep -E '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1 | grep -oE '[a-fA-F0-9]{64}' | head -n1)
-          
-          # Method 2: If empty, try reading first line and extracting hex
-          if [[ -z "$EXPECTED_SHA" ]]; then
-            FIRST_LINE=$(head -n1 "$SHA256FILE")
-            EXPECTED_SHA=$(echo "$FIRST_LINE" | grep -oE '[a-fA-F0-9]{64}' | head -n1)
-          fi
-          
-          if [[ -z "$EXPECTED_SHA" ]]; then
-            echo "❌ Error: Could not extract SHA256 hash from $SHA256FILE"
-            echo "   Content preview (first 3 lines):"
-            head -n3 "$SHA256FILE" | sed 's/^/   /'
-            exit 1
-          fi
-          
-          # Validate SHA256 format
-          if [[ ! "$EXPECTED_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
-            echo "❌ Error: Extracted SHA256 has invalid format: $EXPECTED_SHA"
-            exit 1
-          fi
-          
-          echo "✓ Expected SHA256: $EXPECTED_SHA"
-          
-          # Compute actual SHA256
-          echo "⚙️ Computing actual SHA256..."
-          ACTUAL_SHA=$(sha256sum "$FILENAME" 2>/dev/null | awk '{print $1}')
-          if [[ -z "$ACTUAL_SHA" ]] || [[ ! "$ACTUAL_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
-            echo "❌ Error: Could not compute valid SHA256"
-            exit 1
-          fi
-          echo "✓ Actual SHA256: $ACTUAL_SHA"
-          
-          # Compare
-          if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
-            echo "❌ Error: SHA256 mismatch!"
-            echo "   Expected: $EXPECTED_SHA"
-            echo "   Actual:   $ACTUAL_SHA"
-            exit 1
-          fi
-          echo "✓ SHA256 verification passed"
-          
-          # Verify archive integrity
-          tar -tzf "$FILENAME" >/dev/null 2>&1 || { echo "❌ Error: Invalid or corrupted archive"; exit 1; }
-          echo "✓ Archive integrity verified"
-          
-          # Check for required executable
-          tar -tzf "$FILENAME" | grep -qE '(^|/)AdGuardHome$' || { echo "❌ Error: Archive does not contain AdGuardHome executable"; exit 1; }
-          echo "✓ AdGuardHome executable found in archive"
-          
-          # Check file size
-          SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
-          echo "✓ File size: $SIZE bytes"
-          
-          [[ $SIZE -ge $MIN_FILE_SIZE ]] || { echo "❌ Error: File too small (< $(( MIN_FILE_SIZE / 1000000 ))MB)"; exit 1; }
-          [[ $SIZE -le $MAX_FILE_SIZE ]] || { echo "❌ Error: File too large (> $(( MAX_FILE_SIZE / 1000000 ))MB)"; exit 1; }
-          echo "✓ File size within acceptable range"
-          
-          # Security scan: Check for suspicious files
-          SUSPICIOUS_COUNT=$(tar -tzf "$FILENAME" | grep -iE '(\.sh$|\.bash$|\.py$|\.pl$|\.rb$)' | wc -l)
-          if [[ $SUSPICIOUS_COUNT -gt 5 ]]; then
-            echo "⚠️  Warning: Archive contains $SUSPICIOUS_COUNT potentially executable files"
-          else
-            echo "✓ Security scan passed (found $SUSPICIOUS_COUNT script files)"
-          fi
-          
-          echo ""
-          echo "✅ All verification checks passed successfully"
-
-      - name: Delete old release
-        if: steps.download.outputs.filename
-        run: |
-          set -euo pipefail
-          echo "🗑️ Checking for existing v-latest release..."
-          
-          if gh release view v-latest >/dev/null 2>&1; then
-            echo "✓ Found existing v-latest release, deleting..."
-            if gh release delete v-latest --yes --cleanup-tag; then
-              echo "✓ Successfully deleted old release"
-            else
-              echo "⚠️  Warning: Failed to delete old release, continuing..."
-            fi
-          else
-            echo "✓ No existing v-latest release found (this is normal for first run)"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create new release
-        if: steps.download.outputs.filename
-        run: |
-          # Source environment setup
-          source ~/.workflow_env
-          
+          SHA_FILE="${{ steps.download.outputs.sha_file }}"
           VERSION="${{ steps.version.outputs.version }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
           
-          [[ -n "$VERSION" && -f "$FILENAME" ]] || { echo "Error: Missing required data"; exit 1; }
+          # Delete existing release
+          gh release view v-latest >/dev/null 2>&1 && gh release delete v-latest --yes --cleanup-tag || true
           
+          # Create new release
           gh release create v-latest \
             --title "AdGuardHome v${VERSION}" \
             --notes "## AdGuardHome v${VERSION}
-          
-          **Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          
-          **Source:** $REPO
-          
-          **Architecture:** $ARCH
-          
-          ### Installation
-          \`\`\`bash
-          tar -xzf ${FILENAME}
-          sudo ./AdGuardHome -s install
-          \`\`\`
-          
-          ### Download URL
-          **Fixed download link (always points to latest version):**
-          \`\`\`
-          https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}
-          \`\`\`" \
+
+**Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+**Source:** $REPO
+
+**Architecture:** $ARCH
+
+### Download URL
+\`\`\`
+https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}
+\`\`\`" \
             "$FILENAME"
           
-          echo "Release created successfully"
+          echo "✓ Release updated"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Test download URL
+      - name: Verify release access
         if: steps.download.outputs.filename
         run: |
-          set -euo pipefail
-          # Source environment setup
-          source ~/.workflow_env
+          source "$RUNNER_TEMP/workflow_functions.sh"
           
-          FILENAME="${{ steps.download.outputs.filename }}"
-          TEST_URL="https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}"
+          URL="https://github.com/${{ github.repository }}/releases/download/v-latest/${{ steps.download.outputs.filename }}"
+          echo "🔍 Testing URL..."
           
-          echo "🧪 Testing download URL availability..."
-          echo "   URL: $TEST_URL"
-          
-          # Wait for GitHub CDN to propagate
-          echo "⏳ Waiting 10s for CDN propagation..."
+          # Wait for CDN propagation
           sleep 10
           
-          # Test URL with HEAD request
-          echo "📡 Testing URL with HEAD request..."
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -I --max-time 30 "$TEST_URL" 2>/dev/null || echo "000")
-          
-          case "$HTTP_STATUS" in
-            200)
-              echo "✓ Download URL is accessible (HTTP $HTTP_STATUS)"
-              ;;
-            301|302)
-              echo "✓ Download URL redirects properly (HTTP $HTTP_STATUS)"
-              ;;
-            000)
-              echo "⚠️  Warning: Network request failed or timed out"
-              ;;
-            *)
-              echo "⚠️  Warning: Download URL returned HTTP $HTTP_STATUS (CDN may need more time)"
-              ;;
-          esac
-          
-          # Test actual download (first 1KB) - with error handling
-          echo "📥 Testing partial download (first 1KB)..."
-          TEST_SIZE=$(curl -s -r 0-1024 --max-time 15 --fail "$TEST_URL" 2>/dev/null | wc -c || echo "0")
-          
-          if [[ "$TEST_SIZE" -eq 1025 ]]; then
-            echo "✓ Download test passed (retrieved ${TEST_SIZE} bytes)"
+          if retry curl -s -I --max-time 30 "$URL" | head -1 | grep -qE 'HTTP/[0-9.]+ (200|302)'; then
+            echo "✓ URL accessible"
           else
-            echo "⚠️  Warning: Could not download test chunk (got ${TEST_SIZE} bytes)"
-            echo "   CDN may still be propagating - this is not critical"
+            echo "⚠️ URL may need more time to propagate (non-fatal)"
           fi
-          
-          echo ""
-          echo "✓ URL test completed (release created successfully)"
-
-      - name: Send success notification
-        if: steps.download.outputs.filename && success()
-        run: |
-          echo "✓ Update completed successfully"
-          echo "  - Version: ${{ steps.version.outputs.version }}"
-          echo "  - File: ${{ steps.download.outputs.filename }}"
-          echo "  - Download URL: https://github.com/${{ github.repository }}/releases/download/v-latest/${{ steps.download.outputs.filename }}"
-          
-          # Optional: Add Slack/Discord/Email notifications here
-          # if [[ "${{ env.ENABLE_NOTIFICATIONS }}" == "true" ]] && [[ "${{ env.NOTIFY_ON_SUCCESS }}" == "true" ]]; then
-          #   curl -X POST -H 'Content-type: application/json' \
-          #     --data '{"text":"AdGuardHome updated to v${{ steps.version.outputs.version }}"}' \
-          #     ${{ secrets.NOTIFICATION_WEBHOOK }}
-          # fi
 
       - name: Collect metrics
         if: always()
         id: metrics
         run: |
-          set -euo pipefail
-          
           END_TIME=$(date +%s)
-          START_TIME="${{ steps.init.outputs.start_time }}"
-          DURATION=$((END_TIME - START_TIME))
-          
-          JOB_STATUS="${{ job.status }}"
-          EXIT_CODE=$([[ "$JOB_STATUS" == "success" ]] && echo "0" || echo "1")
-          VERSION_CHECKED="${{ steps.version.outputs.version || 'none' }}"
-          UPDATE_PERFORMED=$([[ -n "${{ steps.download.outputs.filename }}" ]] && echo "true" || echo "false")
+          DURATION=$((END_TIME - ${{ steps.init.outputs.start_time || END_TIME }}))
           
           echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-          echo "version_checked=$VERSION_CHECKED" >> "$GITHUB_OUTPUT"
-          echo "update_performed=$UPDATE_PERFORMED" >> "$GITHUB_OUTPUT"
-          
-          echo ""
-          echo "✓ Metrics collected:"
-          echo "  - Duration: ${DURATION}s"
-          echo "  - Exit code: $EXIT_CODE"
-          echo "  - Version checked: $VERSION_CHECKED"
-          echo "  - Update performed: $UPDATE_PERFORMED"
-
-      - name: Log execution info
-        if: always()
-        run: |
-          # Source environment setup
-          source ~/.workflow_env
-          
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║        AdGuardHome Auto Update - Execution Summary          ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
-          echo ""
-          echo "📊 Workflow Information:"
-          echo "   • Repository:      ${{ github.repository }}"
-          echo "   • Workflow ID:     ${{ github.run_id }}"
-          echo "   • Run Number:      ${{ github.run_number }}"
-          echo "   • Started:         ${{ steps.init.outputs.workflow_started_at }}"
-          echo "   • Duration:        ${{ steps.metrics.outputs.duration }}s"
-          echo "   • Status:          ${{ job.status }}"
-          echo ""
-          echo "🔍 Version Information:"
-          echo "   • Latest Version:  ${{ steps.version.outputs.version || 'N/A' }}"
-          echo "   • Current Version: ${{ steps.current.outputs.current || 'N/A' }}"
-          echo "   • Update Needed:   ${{ steps.compare.outputs.needs_update || 'N/A' }}"
-          echo "   • Update Performed: ${{ steps.metrics.outputs.update_performed }}"
-          echo ""
-          echo "🔗 Fixed Download URL (NEVER CHANGES):"
-          echo "   https://github.com/${{ github.repository }}/releases/download/v-latest/AdGuardHome_${ARCH}.tar.gz"
-          echo ""
-          echo "📈 Performance Metrics:"
-          echo "   • API Timeout:     ${TIMEOUT}s"
-          echo "   • Max Retries:     ${RETRIES}"
-          echo "   • Download Time:   ${CURL_MAX_TIME}s max"
-          echo "   • Min File Size:   $(( MIN_FILE_SIZE / 1000000 ))MB"
-          echo "   • Max File Size:   $(( MAX_FILE_SIZE / 1000000 ))MB"
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║                    End of Summary                           ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
-
-      - name: Handle failure
-        if: failure()
-        run: |
-          echo "❌ Workflow failed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo ""
-          echo "Failure details:"
-          echo "  - Job status: ${{ job.status }}"
-          echo "  - Failed step: Check logs above"
-          echo "  - Version checked: ${{ steps.version.outputs.version || 'N/A' }}"
-          echo ""
-          echo "Troubleshooting steps:"
-          echo "  1. Check network connectivity to GitHub API"
-          echo "  2. Verify GITHUB_TOKEN permissions"
-          echo "  3. Check if AdGuardHome repository is accessible"
-          echo "  4. Verify download URL format hasn't changed"
-          echo ""
-          
-          # Create issue on failure (optional)
-          # if [[ "${{ env.ENABLE_NOTIFICATIONS }}" == "true" ]] && [[ "${{ env.NOTIFY_ON_FAILURE }}" == "true" ]]; then
-          #   gh issue create \
-          #     --title "AdGuardHome update failed - $(date -u '+%Y-%m-%d')" \
-          #     --body "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-          #     --label "bug" \
-          #     --label "automated"
-          # fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "exit_status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+          echo "updated=${{ steps.download.outputs.filename != '' }}" >> "$GITHUB_OUTPUT"
 
       - name: Cleanup
         if: always()
         run: |
-          rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
-          echo "Cleanup completed"
+          rm -rf "$RUNNER_TEMP"/AdGuardHome_*.tar.gz "$RUNNER_TEMP"/*.json
+          echo "✓ Cleanup completed"
+
+      - name: Summary
+        if: always()
+        run: |
+          cat << EOF
+          ╔══════════════════════════════════════════════════════════════╗
+          ║        AdGuardHome Auto Update - Execution Summary          ║
+          ╚══════════════════════════════════════════════════════════════╝
+          • Status: ${{ job.status }}
+          • Duration: ${{ steps.metrics.outputs.duration || 'N/A' }}s
+          • Updated: ${{ steps.metrics.outputs.updated || 'false' }}
+          • Latest Version: ${{ steps.version.outputs.version || 'N/A' }}
+          • Fixed URL: https://github.com/${{ github.repository }}/releases/download/v-latest/AdGuardHome_${{ env.ARCH }}.tar.gz
+          EOF
