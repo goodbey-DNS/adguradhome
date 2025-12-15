@@ -108,28 +108,65 @@ jobs:
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
             
             # 下载文件
-            curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE" || { echo "Failed: $FILE"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
-            curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" || { echo "Failed: $SHA"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
+              echo "Failed: $FILE"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
+            
+            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA"; then
+              echo "Failed: $SHA"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             # 验证文件
-            [[ -s "$FILE" && -s "$SHA" ]] || { echo "Empty files"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            if [[ ! -s "$FILE" || ! -s "$SHA" ]]; then
+              echo "Empty files"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             # 提取并验证SHA256
-            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || \
-                       grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || \
-                       head -n1 "$SHA" | grep -oE '[a-fA-F0-9]{64}')
-            [[ -n "$EXPECTED" ]] || { echo "Cannot extract SHA256"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || true)
+            if [[ -z "$EXPECTED" ]]; then
+              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || true)
+            fi
+            if [[ -z "$EXPECTED" ]]; then
+              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}' || true)
+            fi
+            if [[ -z "$EXPECTED" ]]; then
+              echo "Cannot extract SHA256"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-            [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "SHA256 mismatch"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+              echo "SHA256 mismatch"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             # 验证archive
-            tar -tzf "$FILE" >/dev/null 2>&1 || { echo "Invalid archive"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            if ! tar -tzf "$FILE" >/dev/null 2>&1; then
+              echo "Invalid archive"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             # 验证大小
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            [[ $SIZE -gt $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]] || { echo "File too small"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
-            [[ $SIZE -lt $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]] || { echo "File too large"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            if [[ $SIZE -le $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]]; then
+              echo "File too small"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
+            if [[ $SIZE -ge $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]]; then
+              echo "File too large"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             
             # 全部通过
             break
