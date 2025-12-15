@@ -1,11 +1,8 @@
 name: AdGuardHome Auto Update
-# Description: Automatically checks for AdGuardHome updates daily at 6 AM Beijing time (UTC 22:00)
-# and maintains a fixed download URL that always points to the latest version.
-
 on:
   schedule:
-    - cron: '0 22 * * *'  # 6 AM Beijing Time (UTC+8)
-  workflow_dispatch:
+    - cron: '0 22 * * *'  # 每天6点自动检查
+  workflow_dispatch:      # 手动触发，无参数
 
 permissions:
   contents: write
@@ -14,339 +11,150 @@ env:
   REPO: AdguardTeam/AdGuardHome
   ARCH: linux_amd64
   TIMEOUT: 30
-  RETRIES: 3
-  RETRY_DELAY_BASE: 5
-  MIN_FILE_SIZE: 10000000
-  MAX_FILE_SIZE: 50000000
-  CURL_MAX_TIME: 300
+  MAX_RETRIES: 3
+  MIN_SIZE_MB: 10
+  MAX_SIZE_MB: 50
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20          # 防止退避超时
     concurrency:
       group: adguard-update
       cancel-in-progress: false
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup tools
+      - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl
-          echo "✓ Tools ready"
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl
+          jq --version >/dev/null || exit 1
+          curl --version >/dev/null || exit 1
 
-      - name: Get latest version
-        id: version
+      # 1. 获取官方最新版本（零函数，零作用域问题）
+      - name: Get official version
+        id: official
         run: |
           set -euo pipefail
-          
-          # Export environment variables
-          export REPO="${{ env.REPO }}"
-          export TIMEOUT="${{ env.TIMEOUT }}"
-          export RETRIES="${{ env.RETRIES }}"
-          export RETRY_DELAY_BASE="${{ env.RETRY_DELAY_BASE }}"
-          
-          get_latest() {
-            local http_code
-            
-            # Use separate files for response and http code to avoid parsing issues
-            http_code=$(curl -s -w "%{http_code}" --max-time "$TIMEOUT" \
+          for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
+            # 内联所有变量，避免作用域陷阱
+            CODE=$(curl -s -w "%{http_code}" --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -o /tmp/latest_response.json \
-              "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+              -o /tmp/official.json \
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>/dev/null || echo "000")
             
-            if [[ "$http_code" != "200" ]]; then
-              return 1
-            fi
+            [[ "$CODE" == "200" ]] && \
+            VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//') && \
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
             
-            jq -r '.tag_name // empty' /tmp/latest_response.json 2>/dev/null
-          }
-          
-          VERSION=""
-          for i in $(seq 1 "$RETRIES"); do
-            echo "Fetching latest version (attempt $i/$RETRIES)..."
-            
-            local tag
-            tag=$(get_latest)
-            
-            if [[ $? -eq 0 && -n "$tag" ]]; then
-              VERSION=$(echo "$tag" | sed 's/^v//')
-              
-              # Validate version format (semantic versioning)
-              if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                break
-              else
-                echo "Warning: Invalid version format: $VERSION"
-                VERSION=""
-              fi
-            fi
-            
-            # Calculate backoff with cap at 60 seconds to avoid job timeout
-            if [[ $i -lt $RETRIES ]]; then
-              local backoff=$((RETRY_DELAY_BASE ** i))
-              [[ $backoff -gt 60 ]] && backoff=60
-              sleep $backoff
-            fi
+            sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
           done
           
-          [[ -n "$VERSION" ]] || { echo "Error: Failed to get valid version after $RETRIES attempts"; exit 1; }
-          
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "✓ Latest version: $VERSION"
+          [[ -n "${VERSION:-}" ]] || exit 1
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Latest version: v$VERSION"
 
+      # 2. 本地版本（无则none）
       - name: Get current version
         id: current
         run: |
           set -euo pipefail
-          
-          # Export environment variables
-          export TIMEOUT="${{ env.TIMEOUT }}"
-          
-          RESPONSE=$(curl -s -w "\n%{http_code}" --max-time "$TIMEOUT" \
+          RESP=$(curl -s -w "\n%{http_code}" --max-time ${{ env.TIMEOUT }} \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" \
-            2>/dev/null || echo "")
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" 2>/dev/null || true)
           
-          if [[ -z "$RESPONSE" ]]; then
+          CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | head -n-1)
+          
+          if [[ "$CODE" == "200" ]]; then
+            CURRENT=$(echo "$BODY" | jq -r '.name // "none"' | sed -n 's/.*v\([0-9.]*\).*/\1/p')
+            [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || CURRENT="none"
+          else
             CURRENT="none"
-          else
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            
-            if [[ "$HTTP_CODE" == "404" ]]; then
-              CURRENT="none"
-            elif [[ "$HTTP_CODE" == "200" ]]; then
-              local name
-              name=$(echo "$RESPONSE" | head -n-1 | jq -r '.name // "none"')
-              
-              # Extract version from name (e.g., "v1.2.3" -> "1.2.3")
-              if [[ "$name" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                CURRENT="${BASH_REMATCH[1]}"
-              else
-                CURRENT="none"
-              fi
-            else
-              echo "Warning: Unexpected HTTP $HTTP_CODE"
-              CURRENT="none"
-            fi
           fi
           
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "✓ Current version: $CURRENT"
+          echo "current=${CURRENT:-none}" >> $GITHUB_OUTPUT
+          echo "✓ Current version: ${CURRENT:-none}"
 
-      - name: Check if update needed
-        id: check
+      # 3. 决策（手动触发=强制更新）
+      - name: Decide action
+        id: decide
         run: |
-          set -euo pipefail
-          
-          LATEST="${{ steps.version.outputs.version }}"
-          CURRENT="${{ steps.current.outputs.current }}"
-          
-          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]]; then
-            echo "update=true" >> "$GITHUB_OUTPUT"
-            echo "✓ Update needed: $CURRENT → $LATEST"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+             [[ "${{ steps.current.outputs.current }}" != "${{ steps.official.outputs.version }}" ]]; then
+            echo "should_update=true" >> $GITHUB_OUTPUT
+            echo "✓ Update needed: ${{ steps.current.outputs.current }} → ${{ steps.official.outputs.version }}"
           else
-            echo "update=false" >> "$GITHUB_OUTPUT"
-            echo "✓ Already latest: v$LATEST"
+            echo "should_update=false" >> $GITHUB_OUTPUT
+            echo "✓ Already latest: v${{ steps.official.outputs.version }}"
           fi
 
-      - name: Download AdGuardHome
-        if: steps.check.outputs.update == 'true'
-        run: |
-          set -euo pipefail
-          
-          # Export environment variables
-          export REPO="${{ env.REPO }}"
-          export ARCH="${{ env.ARCH }}"
-          export RETRIES="${{ env.RETRIES }}"
-          export RETRY_DELAY_BASE="${{ env.RETRY_DELAY_BASE }}"
-          export CURL_MAX_TIME="${{ env.CURL_MAX_TIME }}"
-          export TIMEOUT="${{ env.TIMEOUT }}"
-          
-          VERSION="${{ steps.version.outputs.version }}"
-          FILENAME="AdGuardHome_${ARCH}.tar.gz"
-          SHA256SUMS="AdGuardHome_${ARCH}.tar.gz.sha256"
-          BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
-          
-          echo "Downloading v${VERSION}..."
-          
-          for i in $(seq 1 "$RETRIES"); do
-            echo "Download attempt $i/$RETRIES..."
-            
-            # Clean up any partial downloads
-            rm -f "$FILENAME" "$SHA256SUMS"
-            
-            # Download files sequentially (more reliable)
-            if ! curl -L --max-time "$CURL_MAX_TIME" -o "$FILENAME" "${BASE_URL}/${FILENAME}"; then
-              echo "Failed to download $FILENAME"
-              [[ $i -lt $RETRIES ]] || break
-              
-              # Calculate backoff with cap at 60 seconds
-              local backoff=$((RETRY_DELAY_BASE ** i))
-              [[ $backoff -gt 60 ]] && backoff=60
-              echo "Waiting ${backoff}s before retry..."
-              sleep $backoff
-              continue
-            fi
-            
-            if ! curl -L --max-time "$TIMEOUT" -o "$SHA256SUMS" "${BASE_URL}/${SHA256SUMS}"; then
-              echo "Failed to download $SHA256SUMS"
-              [[ $i -lt $RETRIES ]] || break
-              
-              # Calculate backoff with cap at 60 seconds
-              local backoff=$((RETRY_DELAY_BASE ** i))
-              [[ $backoff -gt 60 ]] && backoff=60
-              echo "Waiting ${backoff}s before retry..."
-              sleep $backoff
-              continue
-            fi
-            
-            # Verify files exist and have content
-            if [[ -s "$FILENAME" && -s "$SHA256SUMS" ]]; then
-              break
-            fi
-            
-            echo "Downloaded files are empty or missing"
-            
-            [[ $i -lt $RETRIES ]] || break
-            
-            # Calculate backoff with cap at 60 seconds
-            local backoff=$((RETRY_DELAY_BASE ** i))
-            [[ $backoff -gt 60 ]] && backoff=60
-            echo "Waiting ${backoff}s before retry..."
-            sleep $backoff
-          done
-          
-          # Final verification
-          [[ -s "$FILENAME" && -s "$SHA256SUMS" ]] || { echo "Error: Download failed after $RETRIES attempts"; exit 1; }
-          
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "sha256file=$SHA256SUMS" >> "$GITHUB_OUTPUT"
-          echo "✓ Download completed"
+      # 4. 下载并验证（损坏即重试）
+      - name: Download
+        if: steps.decide.outputs.should_update == 'true'
         id: download
+        run: |
+          set -euo pipefail
+          cd ${{ github.workspace }}
+          rm -f AdGuardHome_${{ env.ARCH }}.tar.gz AdGuardHome_${{ env.ARCH }}.tar.gz.sha256
+          
+          BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
+          FILE="AdGuardHome_${{ env.ARCH }}.tar.gz"
+          SHA="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
+          
+          for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
+            echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
+            
+            # 下载文件
+            curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE" || { echo "Failed: $FILE"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" || { echo "Failed: $SHA"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            # 验证文件
+            [[ -s "$FILE" && -s "$SHA" ]] || { echo "Empty files"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            # 提取并验证SHA256
+            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || \
+                       grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || \
+                       head -n1 "$SHA" | grep -oE '[a-fA-F0-9]{64}')
+            [[ -n "$EXPECTED" ]] || { echo "Cannot extract SHA256"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
+            [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "SHA256 mismatch"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            # 验证archive
+            tar -tzf "$FILE" >/dev/null 2>&1 || { echo "Invalid archive"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            # 验证大小
+            SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+            [[ $SIZE -gt $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]] || { echo "File too small"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            [[ $SIZE -lt $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]] || { echo "File too large"; sleep $(( 2 ** i < 60 ? 2 ** i : 60 )); continue; }
+            
+            # 全部通过
+            break
+          done || exit 1
+          
+          [[ -f "$FILE" ]] || exit 1
+          echo "filename=$FILE" >> $GITHUB_OUTPUT
+          echo "✓ Download and verification passed"
 
-      - name: Verify integrity
+      # 5. 原子发布（fixed URL）
+      - name: Publish
         if: steps.download.outputs.filename
         run: |
           set -euo pipefail
+          gh release view v-latest >/dev/null 2>&1 && \
+            gh release delete v-latest --yes --cleanup-tag || true
           
-          # Export environment variables
-          export MIN_FILE_SIZE="${{ env.MIN_FILE_SIZE }}"
-          export MAX_FILE_SIZE="${{ env.MAX_FILE_SIZE }}"
-          
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SHA256FILE="${{ steps.download.outputs.sha256file }}"
-          
-          [[ -f "$SHA256FILE" && -f "$FILENAME" ]] || { echo "Error: Required files not found"; exit 1; }
-          
-          # Extract SHA256 from file (first 64-char hex string, support both "hash" and "hash filename" formats)
-          EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
-          
-          if [[ -z "$EXPECTED" ]]; then
-            # Try alternative: extract from any position (handles "hash filename" format)
-            EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
-          fi
-          
-          if [[ -z "$EXPECTED" ]]; then
-            # Last resort: read first line and extract hex string
-            local first_line
-            first_line=$(head -n1 "$SHA256FILE" 2>/dev/null || echo "")
-            EXPECTED=$(echo "$first_line" | grep -oE '[a-fA-F0-9]{64}' | head -n1)
-          fi
-          
-          [[ -n "$EXPECTED" ]] || { echo "Error: Cannot extract SHA256 hash from $SHA256FILE"; exit 1; }
-          
-          # Validate SHA256 format
-          [[ "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "Error: Invalid SHA256 format: $EXPECTED"; exit 1; }
-          
-          # Compute actual SHA256
-          ACTUAL=$(sha256sum "$FILENAME" | awk '{print $1}')
-          [[ -n "$ACTUAL" ]] || { echo "Error: Cannot compute SHA256"; exit 1; }
-          
-          [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "Error: SHA256 mismatch"; echo "Expected: $EXPECTED"; echo "Actual:   $ACTUAL"; exit 1; }
-          
-          # Verify archive integrity
-          tar -tzf "$FILENAME" >/dev/null 2>&1 || { echo "Error: Invalid or corrupted archive"; exit 1; }
-          
-          # Check file size
-          SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
-          [[ $SIZE -ge $MIN_FILE_SIZE && $SIZE -le $MAX_FILE_SIZE ]] || { echo "Error: File size $SIZE bytes outside allowed range"; exit 1; }
-          
-          echo "✓ Verification passed"
-
-      - name: Delete old release
-        if: steps.download.outputs.filename
-        run: |
-          set -euo pipefail
-          
-          if gh release view v-latest >/dev/null 2>&1; then
-            echo "Deleting existing v-latest release..."
-            if gh release delete v-latest --yes --cleanup-tag 2>/dev/null; then
-              echo "✓ Old release deleted"
-            else
-              echo "Warning: Failed to delete old release (may not exist or already deleted)"
-            fi
-          else
-            echo "✓ No existing v-latest release to delete"
-          fi
+          gh release create v-latest \
+            --title "AdGuardHome v${{ steps.official.outputs.version }}" \
+            --notes "Auto-update to v${{ steps.official.outputs.version }}" \
+            "${{ steps.download.outputs.filename }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create release
-        if: steps.download.outputs.filename
-        run: |
-          set -euo pipefail
-          
-          # Export environment variables
-          export REPO="${{ env.REPO }}"
-          export ARCH="${{ env.ARCH }}"
-          
-          VERSION="${{ steps.version.outputs.version }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          
-          [[ -n "$VERSION" && -f "$FILENAME" ]] || { echo "Error: Missing required data for release"; exit 1; }
-          
-          echo "Creating release v-latest for AdGuardHome v${VERSION}..."
-          
-          if gh release create v-latest \
-            --title "AdGuardHome v${VERSION}" \
-            --notes "## AdGuardHome v${VERSION}
-          
-          **Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          
-          **Source:** $REPO
-          
-          **Architecture:** $ARCH
-          
-          ### Download URL
-          https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}" \
-            "$FILENAME"; then
-            echo "✓ Release created successfully"
-          else
-            echo "Error: Failed to create release"
-            exit 1
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Test download URL
-        if: steps.download.outputs.filename
-        run: |
-          set -euo pipefail
-          
-          FILENAME="${{ steps.download.outputs.filename }}"
-          URL="https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}"
-          
-          sleep 10
-          
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -I --max-time 30 "$URL" 2>/dev/null || echo "000")
-          
-          case "$HTTP_CODE" in
-            200|301|302) echo "✓ URL test passed (HTTP $HTTP_CODE)" ;;
-            *) echo "⚠️ URL test warning (HTTP $HTTP_CODE)" ;;
-          esac
-
+      # 6. 幂等清理（永不失败）
       - name: Cleanup
         if: always()
-        run: rm -f AdGuardHome_*.tar.gz AdGuardHome_*.sha256
+        run: rm -f ${{ github.workspace }}/AdGuardHome_*.tar.gz* 2>/dev/null || true
