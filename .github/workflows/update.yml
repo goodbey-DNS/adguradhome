@@ -1,11 +1,12 @@
 name: AdGuardHome Auto Update
 on:
   schedule:
-    - cron: '0 22 * * *'  # 每天6点自动检查
+    - cron: '0 22 * * *'  # UTC时间22点（北京时间6点）自动检查
   workflow_dispatch:      # 手动触发，无参数
 
 permissions:
-  contents: write
+  contents: write  # 需要创建release
+  issues: write    # 需要创建issue
 
 env:
   REPO: AdguardTeam/AdGuardHome
@@ -33,26 +34,36 @@ jobs:
           jq --version >/dev/null || exit 1
           curl --version >/dev/null || exit 1
 
-      # 1. 获取官方最新版本（零函数，零作用域问题）
+      # 1. 获取官方最新版本
       - name: Get official version
         id: official
         run: |
           set -euo pipefail
+          VERSION=""
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
-            # 内联所有变量，避免作用域陷阱
             CODE=$(curl -s -w "%{http_code}" --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -o /tmp/official.json \
               "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>/dev/null || echo "000")
             
-            [[ "$CODE" == "200" ]] && \
-            VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//') && \
-            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+            if [[ "$CODE" == "200" ]]; then
+              if VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//'); then
+                if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  break
+                fi
+              fi
+            fi
             
-            sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+            if [[ $i -lt ${{ env.MAX_RETRIES }} ]]; then
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+            fi
           done
           
-          [[ -n "${VERSION:-}" ]] || exit 1
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Failed to get version after ${{ env.MAX_RETRIES }} retries"
+            exit 1
+          fi
+          
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "✓ Latest version: v$VERSION"
 
@@ -65,18 +76,18 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" 2>/dev/null || true)
           
-          CODE=$(echo "$RESP" | tail -n1)
-          BODY=$(echo "$RESP" | head -n-1)
+          Code=$(echo "$RESP" | tail -n1)
+          Body=$(echo "$RESP" | head -n-1)
           
-          if [[ "$CODE" == "200" ]]; then
-            CURRENT=$(echo "$BODY" | jq -r '.name // "none"' | sed -n 's/.*v\([0-9.]*\).*/\1/p')
-            [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || CURRENT="none"
+          if [[ "$Code" == "200" ]]; then
+            Current=$(echo "$Body" | jq -r '.name // "none"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//')
+            [[ "$Current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || Current="none"
           else
-            CURRENT="none"
+            Current="none"
           fi
           
-          echo "current=${CURRENT:-none}" >> $GITHUB_OUTPUT
-          echo "✓ Current version: ${CURRENT:-none}"
+          echo "current=${Current:-none}" >> $GITHUB_OUTPUT
+          echo "✓ Current version: ${Current:-none}"
 
       # 3. 决策（手动触发=强制更新）
       - name: Decide action
@@ -91,7 +102,7 @@ jobs:
             echo "✓ Already latest: v${{ steps.official.outputs.version }}"
           fi
 
-      # 4. 下载并验证（损坏即重试）— FIX: 修复 continue 语法错误
+      # 4. 下载并验证（损坏即重试）
       - name: Download
         if: steps.decide.outputs.should_update == 'true'
         id: download
@@ -107,66 +118,60 @@ jobs:
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
             
-            # FIX1: 改用 || { ...; continue; } 链式语法，避免 if 块内 continue 语法错误
-            curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE" || {
+            # 下载文件
+            if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
               echo "Failed: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
-            curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" || {
+            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA"; then
               echo "Failed: $SHA"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
             # 验证文件
-            [[ -s "$FILE" && -s "$SHA" ]] || {
+            if [[ ! -s "$FILE" || ! -s "$SHA" ]]; then
               echo "Empty files"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
-            # FIX2: 所有 grep 末尾加 || true，防止空文件触发 set -e
-            EXPECTED=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA" | head -n1 || true) || true
+            # 提取并验证SHA256（简化逻辑）
+            EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
             if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || true) || true
-            fi
-            if [[ -z "$EXPECTED" ]]; then
-              EXPECTED=$(head -n1 "$SHA" 2>/dev/null | grep -oE '[a-fA-F0-9]{64}' || true) || true
-            fi
-            if [[ -z "$EXPECTED" ]]; then
-              echo "Cannot extract SHA256"
+              echo "Cannot extract SHA256 from $SHA"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
             ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-            [[ "$EXPECTED" == "$ACTUAL" ]] || {
+            if [[ "$EXPECTED" != "$ACTUAL" ]]; then
               echo "SHA256 mismatch"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
             # 验证archive
-            tar -tzf "$FILE" >/dev/null 2>&1 || {
+            if ! tar -tzf "$FILE" >/dev/null 2>&1; then
               echo "Invalid archive"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
             # 验证大小
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            [[ $SIZE -gt $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]] || {
+            if [[ $SIZE -le $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]]; then
               echo "File too small"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
-            [[ $SIZE -lt $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]] || {
+            fi
+            if [[ $SIZE -ge $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]]; then
               echo "File too large"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
-            }
+            fi
             
             # 全部通过
             break
@@ -195,3 +200,30 @@ jobs:
       - name: Cleanup
         if: always()
         run: rm -f ${{ github.workspace }}/AdGuardHome_*.tar.gz* 2>/dev/null || true
+
+      # 7. 失败通知
+      - name: Notify on failure
+        if: failure()
+        run: |
+          TITLE="AdGuardHome Update Failed - $(date +%Y-%m-%d)"
+          BODY="## Auto-update workflow failed
+
+          **Time:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          **Official Version:** ${{ steps.official.outputs.version }}
+          
+          **Current Version:** ${{ steps.current.outputs.current }}
+          
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          Please check the workflow logs for details."
+          
+          # Create or update issue
+          ISSUE_NUMBER=$(gh issue list --search "$TITLE" --state open --json number --jq '.[0].number')
+          if [[ -n "$ISSUE_NUMBER" ]]; then
+            gh issue comment "$ISSUE_NUMBER" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "bug"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
