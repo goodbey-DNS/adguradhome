@@ -206,7 +206,7 @@ jobs:
               break
             fi
             
-            echo "⚠️  Download attempt $i failed (exit codes: $EXIT_CODE1, $CURL_PID2)"
+            echo "⚠️  Download attempt $i failed (exit codes: $EXIT_CODE1, $EXIT_CODE2)"
             
             if [[ $i -eq ${{ env.RETRIES }} ]]; then
               echo "❌ Error: Download failed after ${{ env.RETRIES }} attempts"
@@ -248,19 +248,68 @@ jobs:
           echo "🔍 Starting integrity verification..."
           
           # Check files exist
-          [[ -f "$SHA256FILE" && -f "$FILENAME" ]] || { echo "❌ Error: Required files not found"; exit 1; }
+          if [[ ! -f "$SHA256FILE" ]] || [[ ! -f "$FILENAME" ]]; then
+            echo "❌ Error: Required files not found"
+            echo "   SHA256 file exists: $([[ -f "$SHA256FILE" ]] && echo 'yes' || echo 'no')"
+            echo "   Download file exists: $([[ -f "$FILENAME" ]] && echo 'yes' || echo 'no')"
+            ls -la "$SHA256FILE" "$FILENAME" 2>&1 || true
+            exit 1
+          fi
           echo "✓ Files exist: $FILENAME, $SHA256FILE"
           
-          # Verify SHA256 checksum
-          EXPECTED_SHA=$(grep -oE '^[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1)
-          [[ -n "$EXPECTED_SHA" ]] || { echo "❌ Error: Could not extract expected SHA256"; exit 1; }
+          # Debug: Show file sizes
+          SHA_SIZE=$(wc -c < "$SHA256FILE")
+          FILE_SIZE=$(wc -c < "$FILENAME")
+          echo "📄 File sizes - SHA256: ${SHA_SIZE} bytes, Archive: ${FILE_SIZE} bytes"
+          
+          # Debug: Show SHA256 file content (first 200 chars)
+          echo "📝 SHA256 file content (first 200 chars):"
+          head -c 200 "$SHA256FILE" | sed 's/^/   /'
+          echo ""
+          
+          # Extract expected SHA256 - try multiple methods
+          echo "🔢 Extracting expected SHA256..."
+          
+          # Method 1: Get first 64-character hex string from file
+          EXPECTED_SHA=$(grep -E '[a-fA-F0-9]{64}' "$SHA256FILE" | head -n1 | grep -oE '[a-fA-F0-9]{64}' | head -n1)
+          
+          # Method 2: If empty, try reading first line and extracting hex
+          if [[ -z "$EXPECTED_SHA" ]]; then
+            FIRST_LINE=$(head -n1 "$SHA256FILE")
+            EXPECTED_SHA=$(echo "$FIRST_LINE" | grep -oE '[a-fA-F0-9]{64}' | head -n1)
+          fi
+          
+          if [[ -z "$EXPECTED_SHA" ]]; then
+            echo "❌ Error: Could not extract SHA256 hash from $SHA256FILE"
+            echo "   Content preview (first 3 lines):"
+            head -n3 "$SHA256FILE" | sed 's/^/   /'
+            exit 1
+          fi
+          
+          # Validate SHA256 format
+          if [[ ! "$EXPECTED_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "❌ Error: Extracted SHA256 has invalid format: $EXPECTED_SHA"
+            exit 1
+          fi
+          
           echo "✓ Expected SHA256: $EXPECTED_SHA"
           
-          ACTUAL_SHA=$(sha256sum "$FILENAME" | awk '{print $1}')
-          [[ -n "$ACTUAL_SHA" ]] || { echo "❌ Error: Could not compute actual SHA256"; exit 1; }
-          echo "✓ Actual SHA256:   $ACTUAL_SHA"
+          # Compute actual SHA256
+          echo "⚙️ Computing actual SHA256..."
+          ACTUAL_SHA=$(sha256sum "$FILENAME" 2>/dev/null | awk '{print $1}')
+          if [[ -z "$ACTUAL_SHA" ]] || [[ ! "$ACTUAL_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "❌ Error: Could not compute valid SHA256"
+            exit 1
+          fi
+          echo "✓ Actual SHA256: $ACTUAL_SHA"
           
-          [[ "$EXPECTED_SHA" == "$ACTUAL_SHA" ]] || { echo "❌ Error: SHA256 verification failed"; exit 1; }
+          # Compare
+          if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+            echo "❌ Error: SHA256 mismatch!"
+            echo "   Expected: $EXPECTED_SHA"
+            echo "   Actual:   $ACTUAL_SHA"
+            exit 1
+          fi
           echo "✓ SHA256 verification passed"
           
           # Verify archive integrity
@@ -294,12 +343,17 @@ jobs:
         if: steps.download.outputs.filename
         run: |
           set -euo pipefail
-          RELEASE_EXISTS=$(gh release view v-latest >/dev/null 2>&1 && echo "true" || echo "false")
-          if [[ "$RELEASE_EXISTS" == "true" ]]; then
-            echo "Deleting existing v-latest release..."
-            gh release delete v-latest --yes --cleanup-tag
+          echo "🗑️ Checking for existing v-latest release..."
+          
+          if gh release view v-latest >/dev/null 2>&1; then
+            echo "✓ Found existing v-latest release, deleting..."
+            if gh release delete v-latest --yes --cleanup-tag; then
+              echo "✓ Successfully deleted old release"
+            else
+              echo "⚠️  Warning: Failed to delete old release, continuing..."
+            fi
           else
-            echo "No existing v-latest release found"
+            echo "✓ No existing v-latest release found (this is normal for first run)"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -350,11 +404,13 @@ jobs:
           echo "🧪 Testing download URL availability..."
           echo "URL: $TEST_URL"
           
-          # Wait a moment for GitHub CDN to propagate
-          sleep 5
+          # Wait for GitHub CDN to propagate (increase wait time)
+          echo "⏳ Waiting for CDN propagation..."
+          sleep 10
           
           # Test URL with HEAD request
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -I --max-time 30 "$TEST_URL")
+          echo "📡 Testing URL with HEAD request..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -I --max-time 30 "$TEST_URL" 2>/dev/null || echo "000")
           
           if [[ "$HTTP_STATUS" == "200" ]]; then
             echo "✓ Download URL is accessible (HTTP $HTTP_STATUS)"
@@ -364,11 +420,14 @@ jobs:
             echo "⚠️  Warning: Download URL returned HTTP $HTTP_STATUS (may need more time to propagate)"
           fi
           
-          # Test actual download (first 1KB)
-          if curl -s -r 0-1024 --max-time 10 "$TEST_URL" | head -c 1024 | wc -c | grep -qE '^1024$'; then
+          # Test actual download (first 1KB) - with error handling
+          echo "📥 Testing actual download (first 1KB)..."
+          if curl -s -r 0-1024 --max-time 15 --fail "$TEST_URL" 2>/dev/null | head -c 1024 | wc -c | grep -qE '^1024$'; then
             echo "✓ Download test passed (first 1KB retrieved successfully)"
           else
-            echo "⚠️  Warning: Could not download test chunk (CDN may still be propagating)"
+            echo "⚠️  Warning: Could not download test chunk (CDN may still be propagating or test failed)"
+            # Don't fail the workflow if test download fails
+            echo "   This is not critical - the release was created successfully"
           fi
 
       - name: Send success notification
