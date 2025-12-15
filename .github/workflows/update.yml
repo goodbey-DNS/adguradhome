@@ -15,238 +15,98 @@ permissions:
   contents: write
 
 env:
-  # 所有配置集中管理
   REPO: AdguardTeam/AdGuardHome
   ARCH: linux_amd64
-  API_TIMEOUT: 30
-  DOWNLOAD_TIMEOUT: 300
-  MAX_RETRIES: 3
-  RETRY_BASE_SEC: 5
-  MIN_SIZE_BYTES: 10000000  # 10MB
-  MAX_SIZE_BYTES: 50000000  # 50MB
+  TIMEOUT: 30
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # 修复：增加超时防止重试被中断
+    timeout-minutes: 20
     
     concurrency:
       group: adguard-update
       cancel-in-progress: false
     
-    # 确保环境一致性
-    defaults:
-      run:
-        shell: bash
-        working-directory: ${{ github.workspace }}
-    
     steps:
-      # 1. 环境初始化
-      - name: Setup environment
-        id: setup
-        run: |
-          set -euo pipefail
-          mkdir -p "${{ github.workspace }}"
-          rm -f AdGuardHome_*.tar.gz  # 清理残留
-          echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
-          set -euo pipefail
-          # 检查工具可用性
-          if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq jq curl
-          fi
-          jq --version >/dev/null && curl --version >/dev/null
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq jq curl >/dev/null
 
-      # 2. 获取最新版本（核心逻辑）
+      # 核心：内联所有变量，不依赖export
       - name: Get latest version
         id: version
         run: |
-          set -euo pipefail
-          
-          # 修复：必须显式导出变量到shell环境
-          export REPO="${{ env.REPO }}"
-          export TIMEOUT="${{ env.API_TIMEOUT }}"
-          export MAX_RETRIES="${{ env.MAX_RETRIES }}"
-          export RETRY_BASE_SEC="${{ env.RETRY_BASE_SEC }}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          
-          # 修复：增加--fail捕获HTTP错误
-          fetch_version() {
-            curl -s --fail --max-time "$TIMEOUT" \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/releases/latest" \
-              2>/dev/null
-          }
-          
-          ATTEMPT=0
-          RESPONSE=""
-          while (( ATTEMPT < MAX_RETRIES )); do
-            if RESPONSE=$(fetch_version); then
-              # 验证响应格式
-              if VERSION=$(echo "$RESPONSE" | jq -r '.tag_name // empty' | sed 's/^v//'); then
-                [[ -n "$VERSION" ]] && break
-              fi
-            fi
-            
-            ((ATTEMPT++))
-            [[ $ATTEMPT -eq $MAX_RETRIES ]] && break
-            
-            sleep $(( RETRY_BASE_SEC * 2 ** (ATTEMPT - 1) ))
+          for i in 1 2 3; do
+            VERSION=$(curl -s --fail --max-time 30 \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ env.REPO }}/releases/latest" | \
+              jq -r '.tag_name' | sed 's/^v//') && break
+            sleep $((2 ** i))
           done
-          
-          # 最终验证
-          [[ -z "$VERSION" ]] && { echo "❌ Failed to get version"; exit 1; }
-          [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "❌ Invalid version: $VERSION"; exit 1; }
-          
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION:-}" >> $GITHUB_OUTPUT
 
-      # 3. 获取当前版本
+      # 核心：直接检查，不存储中间变量
       - name: Get current version
         id: current
         run: |
-          set -euo pipefail
-          
-          export TIMEOUT="${{ env.API_TIMEOUT }}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          
-          RESPONSE=$(curl -s --fail --max-time "$TIMEOUT" \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" \
-            2>/dev/null || echo "")
-          
-          # 严格检查响应
-          if [[ -z "$RESPONSE" ]] || [[ "$(echo "$RESPONSE" | jq -r '.message // empty')" == "Not Found" ]]; then
-            CURRENT="none"
-          else
-            CURRENT=$(echo "$RESPONSE" | jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/')
-          fi
-          
-          # 验证格式
-          if [[ "$CURRENT" != "none" ]] && [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            CURRENT="none"
-          fi
-          
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          CURRENT=$(curl -s --fail --max-time 30 \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" | \
+            jq -r '.name // "none"' | sed 's/^.*v\([0-9.]*\).*$/\1/') || echo "none"
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
 
-      # 4. 决策逻辑
-      - name: Check update needed
+      - name: Check update
         id: check
         run: |
-          set -euo pipefail
-          
-          LATEST="${{ steps.version.outputs.version }}"
-          CURRENT="${{ steps.current.outputs.current }}"
-          FORCE="${{ github.event.inputs.force_update }}"
-          
-          [[ -z "$LATEST" ]] && { echo "❌ Latest version empty"; exit 1; }
-          
-          if [[ "$CURRENT" == "none" ]] || [[ "$CURRENT" != "$LATEST" ]] || [[ "$FORCE" == "true" ]]; then
-            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          if [[ "${{ steps.current.outputs.current }}" == "none" ]] || \
+             [[ "${{ steps.current.outputs.current }}" != "${{ steps.version.outputs.version }}" ]] || \
+             [[ "${{ github.event.inputs.force_update }}" == "true" ]]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
           else
-            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "needs_update=false" >> $GITHUB_OUTPUT
           fi
 
-      # 5. 下载和验证（最关键的健壮性环节）
-      - name: Download and verify
+      # 核心：下载-验证-失败即退出，不复杂判断
+      - name: Download
         if: steps.check.outputs.needs_update == 'true'
         id: download
         run: |
-          set -euo pipefail
+          cd ${{ github.workspace }}
+          rm -f AdGuardHome_${{ env.ARCH }}.tar.gz
           
-          # 必须导出所有变量
-          export REPO="${{ env.REPO }}"
-          export ARCH="${{ env.ARCH }}"
-          export MAX_RETRIES="${{ env.MAX_RETRIES }}"
-          export RETRY_BASE_SEC="${{ env.RETRY_BASE_SEC }}"
-          export DOWNLOAD_TIMEOUT="${{ env.DOWNLOAD_TIMEOUT }}"
-          export MIN_SIZE_BYTES="${{ env.MIN_SIZE_BYTES }}"
-          export MAX_SIZE_BYTES="${{ env.MAX_SIZE_BYTES }}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          URL="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.version.outputs.version }}/AdGuardHome_${{ env.ARCH }}.tar.gz"
           
-          VERSION="${{ steps.version.outputs.version }}"
-          FILENAME="AdGuardHome_${ARCH}.tar.gz"
-          URL="https://github.com/${REPO}/releases/download/v${VERSION}/${FILENAME}"
+          for i in 1 2 3; do
+            curl -L --fail --max-time 300 -o AdGuardHome_${{ env.ARCH }}.tar.gz "$URL" && \
+            tar -tzf AdGuardHome_${{ env.ARCH }}.tar.gz >/dev/null && \
+            break
+            rm -f AdGuardHome_${{ env.ARCH }}.tar.gz
+            sleep $((2 ** i))
+          done || exit 1
           
-          cd "${{ github.workspace }}"
-          [[ -f "$FILENAME" ]] && rm -f "$FILENAME"
-          
-          ATTEMPT=0
-          while (( ATTEMPT < MAX_RETRIES )); do
-            ((ATTEMPT++))
-            echo "Downloading (attempt $ATTEMPT/$MAX_RETRIES)..."
-            
-            if curl -L --fail --max-time "$DOWNLOAD_TIMEOUT" --retry 2 -o "$FILENAME" "$URL"; then
-              # 三重验证
-              SIZE=$(stat -c%s "$FILENAME")
-              if [[ -f "$FILENAME" ]] && \
-                 tar -tzf "$FILENAME" >/dev/null 2>&1 && \
-                 (( SIZE >= MIN_SIZE_BYTES && SIZE <= MAX_SIZE_BYTES )); then
-                echo "✓ Verified: $(( SIZE / 1024 / 1024 ))MB"
-                break
-              fi
-            fi
-            
-            [[ $ATTEMPT -eq $MAX_RETRIES ]] && { echo "❌ Download failed"; exit 1; }
-            rm -f "$FILENAME"
-            sleep $(( RETRY_BASE_SEC * 2 ** (ATTEMPT - 1) ))
-          done
-          
-          [[ -f "$FILENAME" ]] || { echo "❌ File missing"; exit 1; }
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filename=AdGuardHome_${{ env.ARCH }}.tar.gz" >> $GITHUB_OUTPUT
 
-      # 6. 原子发布
+      # 核心：原子操作，删除失败也继续
       - name: Update release
         if: steps.download.outputs.filename
         run: |
-          set -euo pipefail
-          
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          VERSION="${{ steps.version.outputs.version }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          
-          [[ -f "$FILENAME" ]] || { echo "❌ File missing"; exit 1; }
-          [[ -n "$VERSION" ]] || { echo "❌ Version empty"; exit 1; }
-          
-          # 原子操作
           gh release view v-latest >/dev/null 2>&1 && \
             gh release delete v-latest --yes --cleanup-tag || true
           
           gh release create v-latest \
-            --title "AdGuardHome v${VERSION}" \
-            --notes "## AdGuardHome v${VERSION}
+            --title "AdGuardHome v${{ steps.version.outputs.version }}" \
+            --notes "## AdGuardHome v${{ steps.version.outputs.version }}
 
-**Update time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+**URL:** https://github.com/${{ github.repository }}/releases/download/v-latest/${{ steps.download.outputs.filename }}" \
+            ${{ steps.download.outputs.filename }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-**Source:** ${{ env.REPO }}
-
-**Architecture:** ${{ env.ARCH }}
-
-**Fixed URL:**
-\`\`\`
-https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}
-\`\`\`" \
-            "$FILENAME"
-
-      # 7. 验证访问（非致命）
-      - name: Verify release access
-        if: steps.download.outputs.filename
-        run: |
-          FILENAME="${{ steps.download.outputs.filename }}"
-          URL="https://github.com/${{ github.repository }}/releases/download/v-latest/${FILENAME}"
-          
-          sleep 15
-          curl -s --fail -I --max-time "$API_TIMEOUT" "$URL" >/dev/null 2>&1 && \
-            echo "✓ URL OK" || echo "⚠️ URL pending"
-
-      # 8. 强制清理
       - name: Cleanup
         if: always()
-        run: |
-          rm -f "${{ github.workspace }}"/AdGuardHome_*.tar.gz 2>/dev/null || true
+        run: rm -f ${{ github.workspace }}/AdGuardHome_*.tar.gz
