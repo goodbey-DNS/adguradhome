@@ -30,9 +30,10 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl gh
           jq --version >/dev/null || exit 1
           curl --version >/dev/null || exit 1
+          gh --version >/dev/null || exit 1
 
       # 1. 获取官方最新版本
       - name: Get official version
@@ -52,6 +53,13 @@ jobs:
                   break
                 fi
               fi
+            elif [[ "$CODE" == "404" ]]; then
+              echo "Repository or release not found"
+              exit 1
+            elif [[ "$CODE" == "429" ]]; then
+              echo "API rate limit hit, will retry with longer delay"
+              sleep $(( 2 ** i < 120 ? 2 ** i : 120 ))
+              continue
             fi
             
             if [[ $i -lt ${{ env.MAX_RETRIES }} ]]; then
@@ -80,7 +88,11 @@ jobs:
           Body=$(echo "$RESP" | head -n-1)
           
           if [[ "$Code" == "200" ]]; then
+            # 优先从release name提取，失败则从tag_name回退
             Current=$(echo "$Body" | jq -r '.name // "none"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//')
+            if [[ ! "$Current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              Current=$(echo "$Body" | jq -r '.tag_name // "none"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//')
+            fi
             [[ "$Current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || Current="none"
           else
             Current="none"
@@ -93,6 +105,10 @@ jobs:
       - name: Decide action
         id: decide
         run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Current version: ${{ steps.current.outputs.current }}"
+          echo "Official version: ${{ steps.official.outputs.version }}"
+          
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
              [[ "${{ steps.current.outputs.current }}" != "${{ steps.official.outputs.version }}" ]]; then
             echo "should_update=true" >> $GITHUB_OUTPUT
@@ -109,12 +125,13 @@ jobs:
         run: |
           set -euo pipefail
           cd ${{ github.workspace }}
-          rm -f AdGuardHome_${{ env.ARCH }}.tar.gz AdGuardHome_${{ env.ARCH }}.tar.gz.sha256
           
           BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
           FILE="AdGuardHome_${{ env.ARCH }}.tar.gz"
           SHA="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
           
+          SUCCESS=false
+          echo "Starting download for version ${{ steps.official.outputs.version }}"
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
             
@@ -131,81 +148,115 @@ jobs:
               continue
             fi
             
-            # 验证文件
+            # 验证文件存在性和非空
+            if [[ ! -f "$FILE" ]]; then
+              echo "File not found: $FILE"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
+            if [[ ! -f "$SHA" ]]; then
+              echo "File not found: $SHA"
+              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+              continue
+            fi
             if [[ ! -s "$FILE" || ! -s "$SHA" ]]; then
               echo "Empty files"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
-            # 提取并验证SHA256（简化逻辑）
+            # 提取并验证SHA256
             EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
-            if [[ -z "$EXPECTED" ]]; then
-              echo "Cannot extract SHA256 from $SHA"
+            if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
+              echo "Cannot extract valid SHA256 from $SHA"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
             ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
             if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-              echo "SHA256 mismatch"
+              echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
+            echo "✓ SHA256 verification passed"
             
-            # 验证archive
+            # 验证archive完整性
             if ! tar -tzf "$FILE" >/dev/null 2>&1; then
-              echo "Invalid archive"
+              echo "Invalid archive: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
+            echo "✓ Archive integrity check passed"
             
-            # 验证大小
+            # 验证文件大小
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            if [[ $SIZE -le $(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 )) ]]; then
-              echo "File too small"
+            MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
+            MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
+            echo "File size: $SIZE bytes (min: $MIN_SIZE, max: $MAX_SIZE)"
+            if [[ $SIZE -le $MIN_SIZE ]]; then
+              echo "File too small: $SIZE < $MIN_SIZE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
-            if [[ $SIZE -ge $(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 )) ]]; then
-              echo "File too large"
+            if [[ $SIZE -ge $MAX_SIZE ]]; then
+              echo "File too large: $SIZE > $MAX_SIZE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
             # 全部通过
+            SUCCESS=true
             break
-          done || exit 1
+          done
+          
+          if [[ "$SUCCESS" != "true" ]]; then
+            echo "Download failed after ${{ env.MAX_RETRIES }} attempts"
+            exit 1
+          fi
           
           [[ -f "$FILE" ]] || exit 1
           echo "filename=$FILE" >> $GITHUB_OUTPUT
           echo "✓ Download and verification passed"
+          echo "File: $FILE, Size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes"
 
       # 5. 原子发布（fixed URL）
       - name: Publish
-        if: steps.download.outputs.filename
+        if: steps.download.outputs.filename != ''
         run: |
           set -euo pipefail
-          gh release view v-latest >/dev/null 2>&1 && \
-            gh release delete v-latest --yes --cleanup-tag || true
           
+          # 如果release已存在，先删除（忽略错误）
+          if gh release view v-latest >/dev/null 2>&1; then
+            echo "Existing release found, deleting..."
+            gh release delete v-latest --yes --cleanup-tag 2>/dev/null || true
+          fi
+          
+          # 创建新release
           gh release create v-latest \
             --title "AdGuardHome v${{ steps.official.outputs.version }}" \
             --notes "Auto-update to v${{ steps.official.outputs.version }}" \
             "${{ steps.download.outputs.filename }}"
+          
+          echo "✓ Release published successfully"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # 6. 幂等清理（永不失败）
       - name: Cleanup
         if: always()
-        run: rm -f ${{ github.workspace }}/AdGuardHome_*.tar.gz* 2>/dev/null || true
+        run: |
+          # 仅删除本次下载的文件，避免误删
+          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz" 2>/dev/null || true
+          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz.sha256" 2>/dev/null || true
+          echo "✓ Cleanup completed"
 
       # 7. 失败通知
       - name: Notify on failure
         if: failure()
         run: |
-          TITLE="AdGuardHome Update Failed - $(date +%Y-%m-%d)"
+          TIMESTAMP=$(date +%Y-%m-%d-%H)
+          TITLE="AdGuardHome Update Failed - $TIMESTAMP"
           BODY="## Auto-update workflow failed
 
           **Time:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
@@ -218,11 +269,13 @@ jobs:
           
           Please check the workflow logs for details."
           
-          # Create or update issue
-          ISSUE_NUMBER=$(gh issue list --search "$TITLE" --state open --json number --jq '.[0].number')
+          # 搜索相同时间戳的issue（更精确）
+          ISSUE_NUMBER=$(gh issue list --search "AdGuardHome Update Failed - $TIMESTAMP in:title" --state open --json number --jq '.[0].number')
           if [[ -n "$ISSUE_NUMBER" ]]; then
+            echo "Updating existing issue #$ISSUE_NUMBER"
             gh issue comment "$ISSUE_NUMBER" --body "$BODY"
           else
+            echo "Creating new issue"
             gh issue create --title "$TITLE" --body "$BODY" --label "bug"
           fi
         env:
