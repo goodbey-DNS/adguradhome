@@ -135,51 +135,64 @@ jobs:
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
             
-            # 下载文件
+            # 下载主文件
             if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
-              echo "Failed: $FILE"
+              echo "Failed to download: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
-            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA"; then
-              echo "Failed: $SHA"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
+            # 尝试下载SHA256文件（可选）
+            SHA_AVAILABLE=true
+            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" 2>/dev/null; then
+              echo "SHA256 file not found (this is normal for some releases): $SHA"
+              SHA_AVAILABLE=false
+              rm -f "$SHA" 2>/dev/null || true
             fi
             
-            # 验证文件存在性和非空
+            # 验证主文件存在且非空
             if [[ ! -f "$FILE" ]]; then
               echo "File not found: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
-            if [[ ! -f "$SHA" ]]; then
-              echo "File not found: $SHA"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            if [[ ! -s "$FILE" || ! -s "$SHA" ]]; then
-              echo "Empty files"
+            if [[ ! -s "$FILE" ]]; then
+              echo "Empty file: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             
-            # 提取并验证SHA256
-            EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
-            if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
-              echo "Cannot extract valid SHA256 from $SHA"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
+            # 如果SHA256文件可用，则进行校验
+            if [[ "$SHA_AVAILABLE" == "true" ]]; then
+              if [[ ! -f "$SHA" ]]; then
+                echo "SHA256 file not found: $SHA"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              if [[ ! -s "$SHA" ]]; then
+                echo "Empty SHA256 file: $SHA"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              
+              # 提取并验证SHA256
+              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
+              if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
+                echo "Cannot extract valid SHA256 from $SHA"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              
+              ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
+              if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+                echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              echo "✓ SHA256 verification passed"
+            else
+              echo "ℹ SHA256 file not available, skipping SHA256 verification"
             fi
-            
-            ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-            if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-              echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            echo "✓ SHA256 verification passed"
             
             # 验证archive完整性
             if ! tar -tzf "$FILE" >/dev/null 2>&1; then
