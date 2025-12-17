@@ -34,39 +34,24 @@ jobs:
           jq --version >/dev/null || exit 1
           curl --version >/dev/null || exit 1
           gh --version >/dev/null || exit 1
-          tar --version >/dev/null || exit 1
-          df --version >/dev/null || exit 1
-          sha256sum --version >/dev/null || exit 1
-          echo "✓ All required tools installed and verified"
 
       # 1. 获取官方最新版本
       - name: Get official version
         id: official
         run: |
           set -euo pipefail
-          START_TIME=$(date +%s)
           VERSION=""
-          echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting version check for ${{ env.REPO }}"
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] API request attempt $i/${{ env.MAX_RETRIES }}"
             CODE=$(curl -s -w "%{http_code}" --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -o /tmp/official.json \
               "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>/dev/null || echo "000")
             
             if [[ "$CODE" == "200" ]]; then
-              # 验证JSON格式是否有效
-              if jq empty /tmp/official.json 2>/dev/null; then
-                if VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//'); then
-                  if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    break
-                  fi
+              if VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//'); then
+                if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  break
                 fi
-              else
-                echo "Invalid JSON response"
-                rm -f /tmp/official.json 2>/dev/null || true
-                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                continue
               fi
             elif [[ "$CODE" == "404" ]]; then
               echo "Repository or release not found"
@@ -84,20 +69,11 @@ jobs:
           
           if [[ -z "$VERSION" ]]; then
             echo "::error::Failed to get version after ${{ env.MAX_RETRIES }} retries"
-            rm -f /tmp/official.json 2>/dev/null || true
             exit 1
           fi
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "✓ Latest version: v$VERSION"
-          
-          # 记录执行时间
-          END_TIME=$(date +%s)
-          DURATION=$((END_TIME - START_TIME))
-          echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Version check completed in ${DURATION} seconds"
-          
-          # 清理临时文件
-          rm -f /tmp/official.json 2>/dev/null || true
 
       # 2. 本地版本（无则none）
       - name: Get current version
@@ -156,14 +132,6 @@ jobs:
           
           SUCCESS=false
           echo "Starting download for version ${{ steps.official.outputs.version }}"
-          
-          # 检查磁盘空间（至少500MB可用）
-          AVAILABLE_SPACE=$(df -m . | awk 'NR==2 {print $4}')
-          if [[ $AVAILABLE_SPACE -lt 500 ]]; then
-            echo "Insufficient disk space: ${AVAILABLE_SPACE}MB available, 500MB required"
-            exit 1
-          fi
-          echo "✓ Disk space check passed: ${AVAILABLE_SPACE}MB available"
           
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
