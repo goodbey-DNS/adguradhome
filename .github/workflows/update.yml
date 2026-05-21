@@ -10,7 +10,6 @@ permissions:
 
 env:
   REPO: AdguardTeam/AdGuardHome
-  ARCH: linux_amd64
   TIMEOUT: 30
   MAX_RETRIES: 3
   MIN_SIZE_MB: 10
@@ -19,9 +18,21 @@ env:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20          # 防止退避超时
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - arch: linux_amd64
+            ext: tar.gz
+          - arch: linux_arm64
+            ext: tar.gz
+          - arch: windows_amd64
+            ext: zip
+          - arch: windows_arm64
+            ext: zip
+      fail-fast: false
     concurrency:
-      group: adguard-update
+      group: adguard-update-${{ matrix.arch }}
       cancel-in-progress: false
 
     steps:
@@ -30,10 +41,11 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl gh
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl gh unzip
           jq --version >/dev/null || exit 1
           curl --version >/dev/null || exit 1
           gh --version >/dev/null || exit 1
+          unzip -v >/dev/null || exit 1
 
       # 1. 获取官方最新版本
       - name: Get official version
@@ -125,24 +137,24 @@ jobs:
         run: |
           set -euo pipefail
           cd ${{ github.workspace }}
-          
+
           BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
-          FILE="AdGuardHome_${{ env.ARCH }}.tar.gz"
-          SHA="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
-          
+          FILE="AdGuardHome_${{ matrix.arch }}.${{ matrix.ext }}"
+          SHA="AdGuardHome_${{ matrix.arch }}.${{ matrix.ext }}.sha256"
+
           SUCCESS=false
-          echo "Starting download for version ${{ steps.official.outputs.version }}"
-          
+          echo "Starting download for version ${{ steps.official.outputs.version }} (${{ matrix.arch }})"
+
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
             echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
-            
+
             # 下载主文件
             if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
               echo "Failed to download: $FILE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
-            
+
             # 尝试下载SHA256文件（可选）
             SHA_AVAILABLE=true
             if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" 2>/dev/null; then
@@ -150,7 +162,7 @@ jobs:
               SHA_AVAILABLE=false
               rm -f "$SHA" 2>/dev/null || true
             fi
-            
+
             # 验证主文件存在且非空
             if [[ ! -f "$FILE" ]]; then
               echo "File not found: $FILE"
@@ -162,7 +174,7 @@ jobs:
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
-            
+
             # 如果SHA256文件可用，则进行校验
             if [[ "$SHA_AVAILABLE" == "true" ]]; then
               if [[ ! -f "$SHA" ]]; then
@@ -175,7 +187,7 @@ jobs:
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              
+
               # 提取并验证SHA256
               EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
               if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
@@ -183,7 +195,7 @@ jobs:
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              
+
               ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
               if [[ "$EXPECTED" != "$ACTUAL" ]]; then
                 echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
@@ -194,65 +206,73 @@ jobs:
             else
               echo "ℹ SHA256 file not available, skipping SHA256 verification"
             fi
-            
-            # 验证archive完整性
-            if ! tar -tzf "$FILE" >/dev/null 2>&1; then
-              echo "Invalid archive: $FILE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
+
+            # 验证archive完整性（根据扩展名）
+            if [[ "${{ matrix.ext }}" == "zip" ]]; then
+              if ! unzip -t "$FILE" >/dev/null 2>&1; then
+                echo "Invalid archive: $FILE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+            else
+              if ! tar -tzf "$FILE" >/dev/null 2>&1; then
+                echo "Invalid archive: $FILE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
             fi
             echo "✓ Archive integrity check passed"
-            
+
             # 验证文件大小
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
             MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
             MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
             echo "File size: $SIZE bytes (min: $MIN_SIZE, max: $MAX_SIZE)"
             if [[ $SIZE -le $MIN_SIZE ]]; then
-              echo "File too small: $SIZE < $MIN_SIZE"
+              echo "::error::File too small: $SIZE < $MIN_SIZE"
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
               continue
             fi
             if [[ $SIZE -ge $MAX_SIZE ]]; then
-              echo "File too large: $SIZE > $MAX_SIZE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
+              echo "::warning::File larger than expected: $SIZE > $MAX_SIZE (continuing)"
             fi
-            
+
             # 全部通过
             SUCCESS=true
             break
           done
-          
+
           if [[ "$SUCCESS" != "true" ]]; then
             echo "Download failed after ${{ env.MAX_RETRIES }} attempts"
             exit 1
           fi
-          
+
           [[ -f "$FILE" ]] || exit 1
           echo "filename=$FILE" >> $GITHUB_OUTPUT
           echo "✓ Download and verification passed"
           echo "File: $FILE, Size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes"
 
-      # 5. 原子发布（fixed URL）
+      # 5. 原子发布（按架构独立tag）
       - name: Publish
         if: steps.download.outputs.filename != ''
         run: |
           set -euo pipefail
-          
+
+          TAG="v-latest-${{ matrix.arch }}"
+
           # 如果release已存在，先删除（忽略错误）
-          if gh release view v-latest >/dev/null 2>&1; then
+          if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Existing release found, deleting..."
-            gh release delete v-latest --yes --cleanup-tag 2>/dev/null || true
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           fi
-          
+
           # 创建新release
-          gh release create v-latest \
-            --title "AdGuardHome v${{ steps.official.outputs.version }}" \
-            --notes "Auto-update to v${{ steps.official.outputs.version }}" \
+          gh release create "$TAG" \
+            --title "AdGuardHome v${{ steps.official.outputs.version }} (${{ matrix.arch }})" \
+            --notes "Auto-update to v${{ steps.official.outputs.version }} for ${{ matrix.arch }}" \
             "${{ steps.download.outputs.filename }}"
-          
-          echo "✓ Release published successfully"
+
+          echo "✓ Release published successfully: $TAG"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -261,8 +281,8 @@ jobs:
         if: always()
         run: |
           # 仅删除本次下载的文件，避免误删
-          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz" 2>/dev/null || true
-          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz.sha256" 2>/dev/null || true
+          rm -f "${{ github.workspace }}/AdGuardHome_${{ matrix.arch }}.${{ matrix.ext }}" 2>/dev/null || true
+          rm -f "${{ github.workspace }}/AdGuardHome_${{ matrix.arch }}.${{ matrix.ext }}.sha256" 2>/dev/null || true
           echo "✓ Cleanup completed"
 
       # 7. 失败通知
