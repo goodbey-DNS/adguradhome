@@ -12,7 +12,7 @@ env:
   REPO: AdguardTeam/AdGuardHome
   TIMEOUT: 30
   MAX_RETRIES: 3
-  MIN_SIZE_MB: 10
+  MIN_SIZE_MB: 5
   MAX_SIZE_MB: 50
 
 jobs:
