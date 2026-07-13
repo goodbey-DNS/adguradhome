@@ -10,7 +10,7 @@ permissions:
 
 env:
   REPO: AdguardTeam/AdGuardHome
-  ARCH: linux_amd64
+  ARCH_LIST: linux_amd64 linux_arm64
   TIMEOUT: 30
   MAX_RETRIES: 3
   MIN_SIZE_MB: 10
@@ -118,7 +118,7 @@ jobs:
             echo "✓ Already latest: v${{ steps.official.outputs.version }}"
           fi
 
-      # 4. 下载并验证（损坏即重试）
+      # 4. 下载并验证（损坏即重试）—— 循环多架构
       - name: Download
         if: steps.decide.outputs.should_update == 'true'
         id: download
@@ -126,117 +126,133 @@ jobs:
           set -euo pipefail
           cd ${{ github.workspace }}
           
-          BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
-          FILE="AdGuardHome_${{ env.ARCH }}.tar.gz"
-          SHA="AdGuardHome_${{ env.ARCH }}.tar.gz.sha256"
+          ALL_SUCCESS=true
+          FILE_LIST=""
           
-          SUCCESS=false
-          echo "Starting download for version ${{ steps.official.outputs.version }}"
-          
-          for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
-            echo "Download attempt $i/${{ env.MAX_RETRIES }}..."
+          for ARCH in ${{ env.ARCH_LIST }}; do
+            echo "========================================"
+            echo "Processing architecture: $ARCH"
+            echo "========================================"
             
-            # 下载主文件
-            if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
-              echo "Failed to download: $FILE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
+            BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
+            FILE="AdGuardHome_${ARCH}.tar.gz"
+            SHA="AdGuardHome_${ARCH}.tar.gz.sha256"
             
-            # 尝试下载SHA256文件（可选）
-            SHA_AVAILABLE=true
-            if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" 2>/dev/null; then
-              echo "SHA256 file not found (this is normal for some releases): $SHA"
-              SHA_AVAILABLE=false
-              rm -f "$SHA" 2>/dev/null || true
-            fi
+            SUCCESS=false
             
-            # 验证主文件存在且非空
-            if [[ ! -f "$FILE" ]]; then
-              echo "File not found: $FILE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            if [[ ! -s "$FILE" ]]; then
-              echo "Empty file: $FILE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            
-            # 如果SHA256文件可用，则进行校验
-            if [[ "$SHA_AVAILABLE" == "true" ]]; then
-              if [[ ! -f "$SHA" ]]; then
-                echo "SHA256 file not found: $SHA"
-                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                continue
-              fi
-              if [[ ! -s "$SHA" ]]; then
-                echo "Empty SHA256 file: $SHA"
+            for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
+              echo "Download attempt $i/${{ env.MAX_RETRIES }} for $ARCH..."
+              
+              # 下载主文件
+              if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
+                echo "Failed to download: $FILE"
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
               
-              # 提取并验证SHA256
-              EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
-              if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
-                echo "Cannot extract valid SHA256 from $SHA"
+              # 尝试下载SHA256文件（可选）
+              SHA_AVAILABLE=true
+              if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" 2>/dev/null; then
+                echo "SHA256 file not found (this is normal for some releases): $SHA"
+                SHA_AVAILABLE=false
+                rm -f "$SHA" 2>/dev/null || true
+              fi
+              
+              # 验证主文件存在且非空
+              if [[ ! -f "$FILE" ]]; then
+                echo "File not found: $FILE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              if [[ ! -s "$FILE" ]]; then
+                echo "Empty file: $FILE"
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
               
-              ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-              if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-                echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
+              # 如果SHA256文件可用，则进行校验
+              if [[ "$SHA_AVAILABLE" == "true" ]]; then
+                if [[ ! -f "$SHA" ]]; then
+                  echo "SHA256 file not found: $SHA"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+                if [[ ! -s "$SHA" ]]; then
+                  echo "Empty SHA256 file: $SHA"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+                
+                # 提取并验证SHA256
+                EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
+                if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
+                  echo "Cannot extract valid SHA256 from $SHA"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+                
+                ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
+                if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+                  echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+                echo "✓ SHA256 verification passed for $ARCH"
+              else
+                echo "ℹ SHA256 file not available for $ARCH, skipping SHA256 verification"
+              fi
+              
+              # 验证archive完整性
+              if ! tar -tzf "$FILE" >/dev/null 2>&1; then
+                echo "Invalid archive: $FILE"
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              echo "✓ SHA256 verification passed"
-            else
-              echo "ℹ SHA256 file not available, skipping SHA256 verification"
-            fi
+              echo "✓ Archive integrity check passed for $ARCH"
+              
+              # 验证文件大小
+              SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+              MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
+              MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
+              echo "File size: $SIZE bytes (min: $MIN_SIZE, max: $MAX_SIZE)"
+              if [[ $SIZE -le $MIN_SIZE ]]; then
+                echo "File too small: $SIZE < $MIN_SIZE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              if [[ $SIZE -ge $MAX_SIZE ]]; then
+                echo "File too large: $SIZE > $MAX_SIZE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              
+              # 全部通过
+              SUCCESS=true
+              break
+            done
             
-            # 验证archive完整性
-            if ! tar -tzf "$FILE" >/dev/null 2>&1; then
-              echo "Invalid archive: $FILE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+            if [[ "$SUCCESS" != "true" ]]; then
+              echo "Download failed for $ARCH after ${{ env.MAX_RETRIES }} attempts"
+              ALL_SUCCESS=false
               continue
             fi
-            echo "✓ Archive integrity check passed"
             
-            # 验证文件大小
-            SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
-            MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
-            echo "File size: $SIZE bytes (min: $MIN_SIZE, max: $MAX_SIZE)"
-            if [[ $SIZE -le $MIN_SIZE ]]; then
-              echo "File too small: $SIZE < $MIN_SIZE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            if [[ $SIZE -ge $MAX_SIZE ]]; then
-              echo "File too large: $SIZE > $MAX_SIZE"
-              sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-              continue
-            fi
-            
-            # 全部通过
-            SUCCESS=true
-            break
+            FILE_LIST="$FILE_LIST $FILE"
+            echo "✓ Download and verification passed for $ARCH"
+            echo "File: $FILE, Size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes"
           done
           
-          if [[ "$SUCCESS" != "true" ]]; then
-            echo "Download failed after ${{ env.MAX_RETRIES }} attempts"
+          if [[ "$ALL_SUCCESS" != "true" ]]; then
+            echo "One or more architectures failed to download"
             exit 1
           fi
           
-          [[ -f "$FILE" ]] || exit 1
-          echo "filename=$FILE" >> $GITHUB_OUTPUT
-          echo "✓ Download and verification passed"
-          echo "File: $FILE, Size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes"
+          echo "files=$FILE_LIST" >> $GITHUB_OUTPUT
+          echo "✓ All downloads completed"
 
       # 5. 原子发布（fixed URL）
       - name: Publish
-        if: steps.download.outputs.filename != ''
+        if: steps.download.outputs.files != ''
         run: |
           set -euo pipefail
           
@@ -250,7 +266,7 @@ jobs:
           gh release create v-latest \
             --title "AdGuardHome v${{ steps.official.outputs.version }}" \
             --notes "Auto-update to v${{ steps.official.outputs.version }}" \
-            "${{ steps.download.outputs.filename }}"
+            ${{ steps.download.outputs.files }}
           
           echo "✓ Release published successfully"
         env:
@@ -260,9 +276,10 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # 仅删除本次下载的文件，避免误删
-          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz" 2>/dev/null || true
-          rm -f "${{ github.workspace }}/AdGuardHome_${{ env.ARCH }}.tar.gz.sha256" 2>/dev/null || true
+          for ARCH in ${{ env.ARCH_LIST }}; do
+            rm -f "${{ github.workspace }}/AdGuardHome_${ARCH}.tar.gz" 2>/dev/null || true
+            rm -f "${{ github.workspace }}/AdGuardHome_${ARCH}.tar.gz.sha256" 2>/dev/null || true
+          done
           echo "✓ Cleanup completed"
 
       # 7. 失败通知
