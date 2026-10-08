@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5  # v5 使用 Node.js 24，消除 Node 20 弃用警告
 
       - name: Install tools
         run: |
