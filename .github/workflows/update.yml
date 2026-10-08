@@ -10,16 +10,16 @@ permissions:
 
 env:
   REPO: AdguardTeam/AdGuardHome
-  ARCH_LIST: linux_amd64 linux_arm64
+  ARCH_LIST: linux_amd64
   TIMEOUT: 30
   MAX_RETRIES: 3
   MIN_SIZE_MB: 10
-  MAX_SIZE_MB: 50
+  MAX_SIZE_MB: 80   # 预留版本增长余量（当前约10-20MB）
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20          # 防止退避超时
+    timeout-minutes: 20
     concurrency:
       group: adguard-update
       cancel-in-progress: false
@@ -30,10 +30,23 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl gh
-          jq --version >/dev/null || exit 1
-          curl --version >/dev/null || exit 1
-          gh --version >/dev/null || exit 1
+          set -e
+          # ubuntu-latest 已预装 curl/jq，按需补装缺失工具
+          NEED_INSTALL=()
+          command -v curl >/dev/null 2>&1 || NEED_INSTALL+=("curl")
+          command -v jq   >/dev/null 2>&1 || NEED_INSTALL+=("jq")
+          command -v gh   >/dev/null 2>&1 || NEED_INSTALL+=("gh")
+          if [[ ${#NEED_INSTALL[@]} -gt 0 ]]; then
+            echo "Installing missing tools: ${NEED_INSTALL[*]}"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "${NEED_INSTALL[@]}"
+          else
+            echo "✓ All required tools already installed"
+          fi
+          # 最终校验
+          jq --version >/dev/null || { echo "::error::jq not installed"; exit 1; }
+          curl --version >/dev/null || { echo "::error::curl not installed"; exit 1; }
+          gh --version >/dev/null || { echo "::error::gh not installed"; exit 1; }
 
       # 1. 获取官方最新版本
       - name: Get official version
@@ -42,178 +55,177 @@ jobs:
           set -euo pipefail
           VERSION=""
           for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
+            VERSION=""  # 每次重试前重置，避免上次失败残留
             CODE=$(curl -s -w "%{http_code}" --max-time ${{ env.TIMEOUT }} \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
               -o /tmp/official.json \
               "https://api.github.com/repos/${{ env.REPO }}/releases/latest" 2>/dev/null || echo "000")
-            
-            if [[ "$CODE" == "200" ]]; then
-              if VERSION=$(jq -r '.tag_name // empty' /tmp/official.json | sed 's/^v//'); then
+
+            echo "Attempt $i/${{ env.MAX_RETRIES }}: HTTP $CODE"
+
+            case "$CODE" in
+              200)
+                RAW=$(jq -r '.tag_name // empty' /tmp/official.json 2>/dev/null || echo "")
+                VERSION="${RAW#v}"  # 去掉前导 v
                 if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                   break
                 fi
-              fi
-            elif [[ "$CODE" == "404" ]]; then
-              echo "Repository or release not found"
-              exit 1
-            elif [[ "$CODE" == "429" ]]; then
-              echo "API rate limit hit, will retry with longer delay"
-              sleep $(( 2 ** i < 120 ? 2 ** i : 120 ))
-              continue
-            fi
-            
+                echo "::warning::HTTP 200 but invalid version format: '$VERSION'"
+                ;;
+              404)
+                echo "::error::Repository or release not found (404)"
+                exit 1
+                ;;
+              401|403)
+                echo "::error::Auth failed or forbidden ($CODE)"
+                exit 1
+                ;;
+              429)
+                echo "API rate limit hit (429), retrying with longer delay"
+                ;;
+              000)
+                echo "::warning::Network error or timeout"
+                ;;
+              *)
+                echo "::warning::Unexpected HTTP $CODE"
+                ;;
+            esac
+
             if [[ $i -lt ${{ env.MAX_RETRIES }} ]]; then
               sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
             fi
           done
-          
-          if [[ -z "$VERSION" ]]; then
-            echo "::error::Failed to get version after ${{ env.MAX_RETRIES }} retries"
+
+          if [[ -z "$VERSION" || ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Failed to get valid version after ${{ env.MAX_RETRIES }} retries"
             exit 1
           fi
-          
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "✓ Latest version: v$VERSION"
+          # 写入步骤摘要（Actions UI 右侧摘要区显示）
+          echo "### 📦 Official Version: \`v$VERSION\`" >> $GITHUB_STEP_SUMMARY
 
       # 2. 本地版本（无则none）
       - name: Get current version
         id: current
         run: |
           set -euo pipefail
+          CURRENT="none"
+
           RESP=$(curl -s -w "\n%{http_code}" --max-time ${{ env.TIMEOUT }} \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" 2>/dev/null || true)
-          
-          Code=$(echo "$RESP" | tail -n1)
-          Body=$(echo "$RESP" | head -n-1)
-          
-          if [[ "$Code" == "200" ]]; then
-            # 优先从release name提取，失败则从tag_name回退
-            Current=$(echo "$Body" | jq -r '.name // "none"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//')
-            if [[ ! "$Current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              Current=$(echo "$Body" | jq -r '.tag_name // "none"' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//')
-            fi
-            [[ "$Current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || Current="none"
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v-latest" 2>/dev/null || echo "")
+
+          if [[ -z "$RESP" ]]; then
+            echo "::warning::Empty response from current version API, defaulting to 'none'"
           else
-            Current="none"
+            CODE=$(echo "$RESP" | tail -n1)
+            BODY=$(echo "$RESP" | head -n-1)
+
+            case "$CODE" in
+              200)
+                if [[ -n "$BODY" ]]; then
+                  # 优先从 release name 提取，失败则从 tag_name 回退
+                  # 注意：管道在 pipefail 下若 grep 无匹配会返回 1，需 || true 容错
+                  CURRENT=$( { echo "$BODY" | jq -r '.name // empty' 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//'; } || true )
+                  if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    CURRENT=$( { echo "$BODY" | jq -r '.tag_name // empty' 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//'; } || true )
+                  fi
+                  [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || CURRENT="none"
+                fi
+                ;;
+              404)
+                echo "ℹ No existing release found (404), first run"
+                ;;
+              *)
+                echo "::warning::Current version check returned HTTP $CODE, defaulting to 'none'"
+                ;;
+            esac
           fi
-          
-          echo "current=${Current:-none}" >> $GITHUB_OUTPUT
-          echo "✓ Current version: ${Current:-none}"
+
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "✓ Current version: $CURRENT"
+          echo "### 📌 Current Version: \`$CURRENT\`" >> $GITHUB_STEP_SUMMARY
 
       # 3. 决策（手动触发=强制更新）
       - name: Decide action
         id: decide
         run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Current version: ${{ steps.current.outputs.current }}"
-          echo "Official version: ${{ steps.official.outputs.version }}"
-          
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-             [[ "${{ steps.current.outputs.current }}" != "${{ steps.official.outputs.version }}" ]]; then
+          set -euo pipefail
+          EVENT="${{ github.event_name }}"
+          CUR="${{ steps.current.outputs.current }}"
+          OFF="${{ steps.official.outputs.version }}"
+
+          echo "Event: $EVENT"
+          echo "Current version: $CUR"
+          echo "Official version: $OFF"
+
+          if [[ "$EVENT" == "workflow_dispatch" ]] || [[ "$CUR" != "$OFF" ]]; then
             echo "should_update=true" >> $GITHUB_OUTPUT
-            echo "✓ Update needed: ${{ steps.current.outputs.current }} → ${{ steps.official.outputs.version }}"
+            echo "✓ Update needed: $CUR → $OFF"
           else
             echo "should_update=false" >> $GITHUB_OUTPUT
-            echo "✓ Already latest: v${{ steps.official.outputs.version }}"
+            echo "✓ Already latest: v$OFF"
           fi
 
-      # 4. 下载并验证（损坏即重试）—— 循环多架构
+      # 4. 下载并验证（损坏即重试）
       - name: Download
         if: steps.decide.outputs.should_update == 'true'
         id: download
         run: |
           set -euo pipefail
           cd ${{ github.workspace }}
-          
+
           ALL_SUCCESS=true
           FILE_LIST=""
-          
+          # 大小阈值在循环外预计算一次（阈值不随架构变化）
+          MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
+          MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
+
           for ARCH in ${{ env.ARCH_LIST }}; do
             echo "========================================"
             echo "Processing architecture: $ARCH"
             echo "========================================"
-            
+
             BASE="https://github.com/${{ env.REPO }}/releases/download/v${{ steps.official.outputs.version }}"
             FILE="AdGuardHome_${ARCH}.tar.gz"
             SHA="AdGuardHome_${ARCH}.tar.gz.sha256"
-            
+
             SUCCESS=false
-            
+
             for i in $(seq 1 ${{ env.MAX_RETRIES }}); do
               echo "Download attempt $i/${{ env.MAX_RETRIES }} for $ARCH..."
-              
+
+              # 清理上次失败的残留文件
+              rm -f "$FILE" "$SHA" 2>/dev/null || true
+
               # 下载主文件
               if ! curl -L --fail --max-time 300 -o "$FILE" "$BASE/$FILE"; then
                 echo "Failed to download: $FILE"
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              
+
               # 尝试下载SHA256文件（可选）
               SHA_AVAILABLE=true
               if ! curl -L --fail --max-time ${{ env.TIMEOUT }} -o "$SHA" "$BASE/$SHA" 2>/dev/null; then
-                echo "SHA256 file not found (this is normal for some releases): $SHA"
+                echo "ℹ SHA256 file not found (this is normal for some releases): $SHA"
                 SHA_AVAILABLE=false
                 rm -f "$SHA" 2>/dev/null || true
               fi
-              
-              # 验证主文件存在且非空
-              if [[ ! -f "$FILE" ]]; then
-                echo "File not found: $FILE"
-                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                continue
-              fi
+
+              # 1) 非空校验（最快）
               if [[ ! -s "$FILE" ]]; then
-                echo "Empty file: $FILE"
+                echo "Empty or missing file: $FILE"
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              
-              # 如果SHA256文件可用，则进行校验
-              if [[ "$SHA_AVAILABLE" == "true" ]]; then
-                if [[ ! -f "$SHA" ]]; then
-                  echo "SHA256 file not found: $SHA"
-                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                  continue
-                fi
-                if [[ ! -s "$SHA" ]]; then
-                  echo "Empty SHA256 file: $SHA"
-                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                  continue
-                fi
-                
-                # 提取并验证SHA256
-                EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1) || true
-                if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
-                  echo "Cannot extract valid SHA256 from $SHA"
-                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                  continue
-                fi
-                
-                ACTUAL=$(sha256sum "$FILE" | awk '{print $1}')
-                if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-                  echo "SHA256 mismatch: expected $EXPECTED, got $ACTUAL"
-                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                  continue
-                fi
-                echo "✓ SHA256 verification passed for $ARCH"
-              else
-                echo "ℹ SHA256 file not available for $ARCH, skipping SHA256 verification"
-              fi
-              
-              # 验证archive完整性
-              if ! tar -tzf "$FILE" >/dev/null 2>&1; then
-                echo "Invalid archive: $FILE"
-                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
-                continue
-              fi
-              echo "✓ Archive integrity check passed for $ARCH"
-              
-              # 验证文件大小
+
+              # 2) 大小校验（stat，快）
               SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-              MIN_SIZE=$(( ${{ env.MIN_SIZE_MB }} * 1024 * 1024 ))
-              MAX_SIZE=$(( ${{ env.MAX_SIZE_MB }} * 1024 * 1024 ))
               echo "File size: $SIZE bytes (min: $MIN_SIZE, max: $MAX_SIZE)"
               if [[ $SIZE -le $MIN_SIZE ]]; then
                 echo "File too small: $SIZE < $MIN_SIZE"
@@ -225,89 +237,168 @@ jobs:
                 sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
                 continue
               fi
-              
+
+              # 3) archive 完整性（读 header，较快）
+              if ! tar -tzf "$FILE" >/dev/null 2>&1; then
+                echo "Invalid archive: $FILE"
+                sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                continue
+              fi
+              echo "✓ Archive integrity check passed for $ARCH"
+
+              # 4) SHA256 校验（需读全文件，最慢，放最后）
+              if [[ "$SHA_AVAILABLE" == "true" ]]; then
+                if [[ ! -s "$SHA" ]]; then
+                  echo "Empty SHA256 file: $SHA"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+
+                EXPECTED=$(grep -oE '[a-fA-F0-9]{64}' "$SHA" | head -n1 || true)
+                if [[ -z "$EXPECTED" || ! "$EXPECTED" =~ ^[a-fA-F0-9]{64}$ ]]; then
+                  echo "Cannot extract valid SHA256 from $SHA"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+
+                ACTUAL=$( { sha256sum "$FILE" | awk '{print $1}'; } || true )
+                if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+                  echo "::error::SHA256 mismatch for $ARCH: expected $EXPECTED, got $ACTUAL"
+                  sleep $(( 2 ** i < 60 ? 2 ** i : 60 ))
+                  continue
+                fi
+                echo "✓ SHA256 verification passed for $ARCH"
+              else
+                echo "ℹ SHA256 file not available for $ARCH, skipping SHA256 verification"
+              fi
+
               # 全部通过
               SUCCESS=true
               break
             done
-            
+
             if [[ "$SUCCESS" != "true" ]]; then
-              echo "Download failed for $ARCH after ${{ env.MAX_RETRIES }} attempts"
+              echo "::error::Download failed for $ARCH after ${{ env.MAX_RETRIES }} attempts"
               ALL_SUCCESS=false
+              # 清理该架构失败遗留的文件，避免被错误地发布
+              rm -f "$FILE" "$SHA" 2>/dev/null || true
               continue
             fi
-            
+
             FILE_LIST="$FILE_LIST $FILE"
             echo "✓ Download and verification passed for $ARCH"
             echo "File: $FILE, Size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes"
           done
-          
+
           if [[ "$ALL_SUCCESS" != "true" ]]; then
-            echo "One or more architectures failed to download"
+            echo "::error::One or more architectures failed to download"
             exit 1
           fi
-          
+
+          # 去除前导空格并输出
+          FILE_LIST="${FILE_LIST# }"
           echo "files=$FILE_LIST" >> $GITHUB_OUTPUT
           echo "✓ All downloads completed"
 
       # 5. 原子发布（fixed URL）
       - name: Publish
-        if: steps.download.outputs.files != ''
+        if: steps.decide.outputs.should_update == 'true' && steps.download.outputs.files != ''
+        id: publish
         run: |
           set -euo pipefail
-          
-          # 如果release已存在，先删除（忽略错误）
+          VERSION="${{ steps.official.outputs.version }}"
+          FILES="${{ steps.download.outputs.files }}"
+
+          # 如果release已存在，先删除（忽略错误，但等待删除完成）
           if gh release view v-latest >/dev/null 2>&1; then
             echo "Existing release found, deleting..."
             gh release delete v-latest --yes --cleanup-tag 2>/dev/null || true
+            sleep 2  # 等待 GitHub 后端同步，避免 create 冲突
           fi
-          
+
           # 创建新release
           gh release create v-latest \
-            --title "AdGuardHome v${{ steps.official.outputs.version }}" \
-            --notes "Auto-update to v${{ steps.official.outputs.version }}" \
-            ${{ steps.download.outputs.files }}
-          
+            --title "AdGuardHome v$VERSION" \
+            --notes "Auto-update to v$VERSION" \
+            $FILES
+
           echo "✓ Release published successfully"
+          echo "### ✅ Published: \`v-latest\` → \`v$VERSION\`" >> $GITHUB_STEP_SUMMARY
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 6. 幂等清理（永不失败）
+      # 6. 发布后资产校验（确保 assets 真的上传成功）
+      - name: Verify assets
+        if: steps.publish.outcome == 'success'
+        run: |
+          set -euo pipefail
+          echo "Verifying release assets..."
+          ASSETS=$(gh release view v-latest --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+          if [[ -z "$ASSETS" ]]; then
+            echo "::error::No assets found in release v-latest"
+            exit 1
+          fi
+          echo "✓ Assets in release v-latest:"
+          echo "$ASSETS" | sed 's/^/  - /'
+          EXPECTED_COUNT=$(echo "${{ env.ARCH_LIST }}" | wc -w)
+          ACTUAL_COUNT=$(echo "$ASSETS" | wc -l)
+          echo "Expected: $EXPECTED_COUNT, Actual: $ACTUAL_COUNT"
+          if [[ $ACTUAL_COUNT -lt $EXPECTED_COUNT ]]; then
+            echo "::error::Asset count mismatch: expected $EXPECTED_COUNT, got $ACTUAL_COUNT"
+            exit 1
+          fi
+          echo "✓ Asset verification passed"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 7. 幂等清理（永不失败）
       - name: Cleanup
         if: always()
         run: |
+          set -e
           for ARCH in ${{ env.ARCH_LIST }}; do
             rm -f "${{ github.workspace }}/AdGuardHome_${ARCH}.tar.gz" 2>/dev/null || true
             rm -f "${{ github.workspace }}/AdGuardHome_${ARCH}.tar.gz.sha256" 2>/dev/null || true
           done
+          rm -f /tmp/official.json 2>/dev/null || true
           echo "✓ Cleanup completed"
 
-      # 7. 失败通知
+      # 8. 失败通知
       - name: Notify on failure
         if: failure()
         run: |
+          set -euo pipefail
           TIMESTAMP=$(date +%Y-%m-%d-%H)
           TITLE="AdGuardHome Update Failed - $TIMESTAMP"
+          OFF_VER="${{ steps.official.outputs.version }}"
+          CUR_VER="${{ steps.current.outputs.current }}"
+          # 步骤可能失败导致输出为空，给默认值避免通知信息缺失
+          OFF_VER="${OFF_VER:-unknown}"
+          CUR_VER="${CUR_VER:-unknown}"
           BODY="## Auto-update workflow failed
 
           **Time:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          
-          **Official Version:** ${{ steps.official.outputs.version }}
-          
-          **Current Version:** ${{ steps.current.outputs.current }}
-          
+
+          **Official Version:** $OFF_VER
+
+          **Current Version:** $CUR_VER
+
           **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          
+
           Please check the workflow logs for details."
-          
-          # 搜索相同时间戳的issue（更精确）
-          ISSUE_NUMBER=$(gh issue list --search "AdGuardHome Update Failed - $TIMESTAMP in:title" --state open --json number --jq '.[0].number')
+
+          # 搜索相同标题的已开启 issue（in:title 限定标题字段）
+          ISSUE_NUMBER=$(gh issue list --search "$TITLE in:title" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
           if [[ -n "$ISSUE_NUMBER" ]]; then
             echo "Updating existing issue #$ISSUE_NUMBER"
             gh issue comment "$ISSUE_NUMBER" --body "$BODY"
           else
             echo "Creating new issue"
-            gh issue create --title "$TITLE" --body "$BODY" --label "bug"
+            # 尝试带 label 创建，若 label 不存在则去掉 label 重试
+            if ! gh issue create --title "$TITLE" --body "$BODY" --label "bug" 2>/dev/null; then
+              echo "Label 'bug' not found, creating issue without label"
+              gh issue create --title "$TITLE" --body "$BODY"
+            fi
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
